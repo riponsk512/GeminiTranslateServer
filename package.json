@@ -1,16 +1,18 @@
+
 {
   "name": "geminitranslateserver",
   "version": "1.0.0",
-  "description": "Dedicated Real-Time Bidirectional Gemini 3.5 Live Voice Translation Server",
+  "description": "Dedicated Real-Time Bidirectional Gemini Live Voice Translation Server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
+  "license": "ISC",
   "dependencies": {
-    "@google/genai": "^0.1.2",
+    "@google/genai": "^3.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
