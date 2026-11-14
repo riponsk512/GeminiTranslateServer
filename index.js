@@ -1,134 +1,112 @@
-async function connectGeminiLive(listener, roomId, targetLang) {
-  const { GoogleGenAI } = await import("@google/genai");
+// GeminiTranslateServer/index.js
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const https = require("https");
+const cors = require("cors");
+const WebSocket = require("ws");
+const { Server } = require("socket.io");
 
-  const ai = new GoogleGenAI({
-    apiKey: "AQ.Ab8RN6L5udfI-yMzJVNOyCfIvVtxVjR3mndu9P9EsSGd3HjpHQ",
-    httpOptions: {
-      apiVersion: "v1beta",
-    },
-  });
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-  let session = null;
+const server = http.createServer(app);
 
-  const config = {
-    responseModalities: ["AUDIO"],
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+  maxHttpBufferSize: 1e7,
+  pingInterval: 4000,
+  pingTimeout: 8000,
+  transports: ["websocket", "polling"],
+});
 
-    inputAudioTranscription: {},
-    outputAudioTranscription: {},
+const PORT = process.env.PORT || 10000;
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY ||
+  "AQ.Ab8RN6J18Lri4K34bssqzHMCnIAzIQBVQsxfGW31jGH5qerzJQ";
+const GEMINI_LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
 
-    translationConfig: {
-      targetLanguageCode: targetLang,
-      echoTargetLanguage: true,
-    },
-  };
+const GEMINI_WS_URLS = [
+  `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+    GEMINI_API_KEY
+  )}`,
+  `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+    GEMINI_API_KEY
+  )}`,
+];
 
-  try {
-    session = await ai.live.connect({
-      model: GEMINI_LIVE_MODEL,
-      config,
+const LANGUAGE_NAMES = {
+  en: "English",
+  bn: "Bengali",
+  hi: "Hindi",
+  ur: "Urdu",
+  ar: "Arabic",
+  id: "Indonesian",
+  pt: "Portuguese",
+  es: "Spanish",
+  ru: "Russian",
+  ja: "Japanese",
+  ko: "Korean",
+  fr: "French",
+  de: "German",
+  tr: "Turkish",
+  vi: "Vietnamese",
+  th: "Thai",
+  ms: "Malay",
+  tl: "Filipino",
+  zh: "Chinese",
+  ta: "Tamil",
+  te: "Telugu",
+  mr: "Marathi",
+  gu: "Gujarati",
+  kn: "Kannada",
+  ml: "Malayalam",
+  pa: "Punjabi",
+  ne: "Nepali",
+};
 
-      callbacks: {
-        onopen: () => {
-          console.log("[GEMINI_CONNECTED]", {
-            roomId,
-            listener: listener.email,
-            targetLang,
-            model: GEMINI_LIVE_MODEL,
-            apiVersion: "v1beta",
-          });
+function getLangFullName(code) {
+  const clean = String(code || "en")
+    .split("-")[0]
+    .toLowerCase();
+  return LANGUAGE_NAMES[clean] || clean.toUpperCase();
+}
 
-          io.to(listener.socketId).emit(
-            "gemini_session_status",
-            {
-              connected: true,
-              targetLanguageCode: targetLang,
-            }
-          );
-        },
+// Detect if Gemini hallucinated Cyrillic/Russian when neither speaker nor listener selected Russian
+function isHallucinatedScript(text, speakLang, listenLang) {
+  if (!text) return true;
+  const s = String(speakLang || "en").split("-")[0].toLowerCase();
+  const l = String(listenLang || "en").split("-")[0].toLowerCase();
+  const hasCyrillic = /[\u0400-\u04FF]/.test(text);
+  if (hasCyrillic && s !== "ru" && s !== "uk" && l !== "ru" && l !== "uk") {
+    return true;
+  }
+  return false;
+}
 
-        onmessage: async (message) => {
-          try {
-            const content = message?.serverContent;
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ [UNCAUGHT_EXCEPTION]", err?.message || err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ [UNHANDLED_REJECTION]", reason?.message || reason);
+});
 
-            if (!content) return;
-
-            if (content.inputTranscription?.text) {
-              io.to(listener.socketId).emit(
-                "translated_subtitle",
-                {
-                  roomId,
-                  originalText:
-                    content.inputTranscription.text,
-                  translatedText: null,
-                  targetLang,
-                  isFinal: false,
-                }
-              );
-            }
-
-            if (content.outputTranscription?.text) {
-              io.to(listener.socketId).emit(
-                "translated_subtitle",
-                {
-                  roomId,
-                  originalText: null,
-                  translatedText:
-                    content.outputTranscription.text,
-                  targetLang,
-                  isFinal: Boolean(content.turnComplete),
-                }
-              );
-            }
-
-            for (const part of content.modelTurn?.parts || []) {
-              if (part?.inlineData?.data) {
-                const pcmBuffer = Buffer.from(
-                  part.inlineData.data,
-                  "base64"
-                );
-
-                // Send the PCM to your existing WAV
-                // packet-building/playback pipeline.
-                listener.onGeminiAudio?.(pcmBuffer);
-              }
-            }
-          } catch (error) {
-            console.error("[GEMINI_MESSAGE_ERROR]", error);
-          }
-        },
-
-        onerror: (error) => {
-          console.error(
-            "[GEMINI_SESSION_ERROR]",
-            error?.message || error
-          );
-        },
-
-        onclose: (event) => {
-          console.log("[GEMINI_SESSION_CLOSED]", {
-            roomId,
-            reason: event?.reason || "No reason provided",
-          });
-
-          // Do not reference session here.
-          // The connection is already closing.
-        },
-      },
-    });
-
-    listener.geminiSession = session;
-
-    return session;
-  } catch (error) {
-    console.error("[GEMINI_CONNECT_FAILED]", {
-      roomId,
-      listener: listener.email,
-      targetLang,
-      message: error?.message || String(error),
-    });
-
-    listener.geminiSession = null;
-
-    throw error;
+function logTranslate(tag, msg, meta = null) {
+  const ts = new Date().toISOString();
+  if (meta) {
+    console.log(`[${ts}] [GEMINI:${tag}] ${msg}`, JSON.stringify(meta));
+  } else {
+    console.log(`[${ts}] [GEMINI:${tag}] ${msg}`);
   }
 }
+
+// ============================================================================
+// 🔊 WAV HEADER BUILDER & RMS AUDIO ENERGY METER
+// ============================================================================
+function buildWavBufferFromPcmBuffers(pcmBuffers, sampleRate = 16000) {
+  const pcmData = Buffer.concat(pcmBuffers);
+  const dataLen = pcmData.length;
