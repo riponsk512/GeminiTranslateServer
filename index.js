@@ -28,7 +28,11 @@ const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   "AQ.Ab8RN6J18Lri4K34bssqzHMCnIAzIQBVQsxfGW31jGH5qerzJQ";
 const GEMINI_LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
-const GEMINI_FLASH_MODEL = "gemini-3.8-flash";
+const GEMINI_FLASH_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+];
 
 process.on("uncaughtException", (err) => {
   console.error("⚠️ [UNCAUGHT_EXCEPTION]", err?.message || err);
@@ -47,7 +51,7 @@ function logTranslate(tag, msg, meta = null) {
 }
 
 // ============================================================================
-// 🌐 SERVER-SIDE TRANSLATION & VOICE AUDIO SYNTHESIS
+// 🌐 SERVER-SIDE TRANSLATION & NEURAL VOICE SYNTHESIS
 // ============================================================================
 function translateTextOnServer(text, targetLang = "en", sourceLang = "auto") {
   return new Promise((resolve) => {
@@ -142,7 +146,7 @@ function buildWavBufferFromPcmBuffers(pcmBuffers, sampleRate = 16000) {
 function calculatePcmBufferRms(pcmBuf) {
   if (!pcmBuf || pcmBuf.length < 4) return 0;
   const samples = Math.floor(pcmBuf.length / 2);
-  const step = Math.max(1, Math.floor(samples / 150));
+  const step = Math.max(1, Math.floor(samples / 200));
   let sumSq = 0;
   let count = 0;
   for (let i = 0; i < samples; i += step) {
@@ -184,7 +188,7 @@ async function closeListenerGeminiSession(participant) {
 }
 
 // ============================================================================
-// 🤖 CONNECT GEMINI 3.5 LIVE TRANSLATE (NO `mediaResolution` -> ZERO 400 ERRORS!)
+// 🤖 CONNECT GEMINI 3.5 LIVE TRANSLATE (SILENCE-FILTERED 24kHz AUDIO STREAM)
 // ============================================================================
 async function ensureListenerGeminiSession(roomId, listenerKey) {
   const room = rooms.get(roomId);
@@ -209,7 +213,6 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
     return listener.geminiSession;
   }
 
-  // Cooldown guard: never spam reconnects faster than once every 3 seconds
   const now = Date.now();
   if (
     listener.isConnecting ||
@@ -231,7 +234,6 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
       httpOptions: { apiVersion: "v1alpha" },
     });
 
-    // Clean Audio-Only Config: NO `mediaResolution` (which caused "MediaResolution is not supported")!
     const config = {
       responseModalities: [Modality?.AUDIO || "AUDIO"],
       translationConfig: {
@@ -247,6 +249,8 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
 
     let currentInputText = "";
     let currentOutputText = "";
+    let hadSpeechInCurrentTurn = false;
+    let silenceTailTimer = null;
 
     activeSessionRef = await ai.live.connect({
       model: GEMINI_LIVE_MODEL,
@@ -281,18 +285,47 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
             const parts = sc.modelTurn?.parts || [];
             for (const part of parts) {
               if (part?.inlineData?.data) {
-                listener.lastLiveAudioAt = Date.now();
-                logTranslate(
-                  "GEMINI_AUDIO_OUT",
-                  `🔊 Streaming 24kHz translated PCM chunk to ${listener.email} (${part.inlineData.data.length} chars)`
-                );
-                io.to(listener.socketId).emit("translated_audio_chunk", {
-                  roomId,
-                  pcm24kBase64: part.inlineData.data,
-                  sampleRate: 24000,
-                  targetLang,
-                  timestamp: Date.now(),
-                });
+                // CRITICAL FIX: Measure RMS energy of Gemini's 24kHz PCM chunk.
+                // Gemini streams 16,000-char (250ms) digital silence frames when idle.
+                // Only forward chunks that actually contain audible speech (outRms >= 0.004)!
+                const outBuf = Buffer.from(part.inlineData.data, "base64");
+                const outRms = calculatePcmBufferRms(outBuf);
+
+                if (outRms >= 0.004) {
+                  hadSpeechInCurrentTurn = true;
+                  listener.lastLiveAudioAt = Date.now();
+                  logTranslate(
+                    "GEMINI_SPEECH_OUT",
+                    `🔊 Streaming 24kHz translated SPEECH to ${listener.email} (rms: ${outRms.toFixed(
+                      4
+                    )}, ${part.inlineData.data.length} chars)`
+                  );
+                  io.to(listener.socketId).emit("translated_audio_chunk", {
+                    roomId,
+                    pcm24kBase64: part.inlineData.data,
+                    sampleRate: 24000,
+                    targetLang,
+                    timestamp: Date.now(),
+                  });
+
+                  // Auto-flush client playback queue 450ms after speech chunks stop arriving
+                  clearTimeout(silenceTailTimer);
+                  silenceTailTimer = setTimeout(() => {
+                    if (hadSpeechInCurrentTurn) {
+                      hadSpeechInCurrentTurn = false;
+                      io.to(listener.socketId).emit(
+                        "translated_turn_complete",
+                        {
+                          roomId,
+                          originalText: currentInputText || null,
+                          translatedText: currentOutputText || null,
+                          targetLang,
+                          timestamp: Date.now(),
+                        }
+                      );
+                    }
+                  }, 450);
+                }
               }
               if (part?.text && part.text.trim()) {
                 currentOutputText =
@@ -315,21 +348,23 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
               const finalTrans = currentOutputText;
               currentInputText = "";
               currentOutputText = "";
+              hadSpeechInCurrentTurn = false;
 
-              logTranslate(
-                "GEMINI_TURN_DONE",
-                `✅ Turn complete for ${listener.email}: "${
-                  finalTrans || finalOrig || "audio_stream"
-                }"`
-              );
-
-              io.to(listener.socketId).emit("translated_turn_complete", {
-                roomId,
-                originalText: finalOrig || null,
-                translatedText: finalTrans || null,
-                targetLang,
-                timestamp: Date.now(),
-              });
+              if (finalOrig || finalTrans) {
+                logTranslate(
+                  "GEMINI_TURN_DONE",
+                  `✅ Turn complete for ${listener.email}: "${
+                    finalTrans || finalOrig
+                  }"`
+                );
+                io.to(listener.socketId).emit("translated_turn_complete", {
+                  roomId,
+                  originalText: finalOrig || null,
+                  translatedText: finalTrans || null,
+                  targetLang,
+                  timestamp: Date.now(),
+                });
+              }
             }
           } catch (err) {}
         },
@@ -340,6 +375,7 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
           );
         },
         onclose: (ev) => {
+          clearTimeout(silenceTailTimer);
           logTranslate(
             "SESSION_CLOSE",
             `Session closed for ${listener.email} (${ev?.reason || "closed"})`
@@ -369,7 +405,7 @@ async function ensureListenerGeminiSession(roomId, listenerKey) {
 }
 
 // ============================================================================
-// 🎙️ DELIVER TRANSLATED SPEECH + AUDIO TO LISTENER
+// 🎙️ DELIVER TRANSLATED SUBTITLES + VOICE AUDIO TO LISTENER
 // ============================================================================
 async function deliverTranslatedSpeechToListener(
   roomId,
@@ -401,6 +437,7 @@ async function deliverTranslatedSpeechToListener(
       } (${targetLang}): "${cleanOrig}" => "${translatedText}"`
     );
 
+    // 1. Always send original + translated subtitles to Listener
     io.to(listener.socketId).emit("translated_subtitle", {
       roomId,
       originalText: cleanOrig,
@@ -410,6 +447,7 @@ async function deliverTranslatedSpeechToListener(
       isFinal: true,
     });
 
+    // 2. Also send Speaker's own subtitle back to Speaker
     if (speaker && speaker.translatorEnabled && speaker.hasMinutes) {
       io.to(speaker.socketId).emit("speaker_own_subtitle", {
         roomId,
@@ -419,12 +457,10 @@ async function deliverTranslatedSpeechToListener(
       });
     }
 
-    // If Gemini Live WebSocket didn't stream audio within 500ms, stream synthesized MP3 voice audio!
-    setTimeout(async () => {
-      const timeSinceLiveAudio = Date.now() - (listener.lastLiveAudioAt || 0);
-      if (timeSinceLiveAudio < 1200) {
-        return;
-      }
+    // 3. If Gemini Live WebSocket didn't stream non-silent speech in the last 1.2s,
+    //    stream high-clarity synthesized MP3 voice audio so Listener ALWAYS hears the translation!
+    const timeSinceLiveAudio = Date.now() - (listener.lastLiveAudioAt || 0);
+    if (timeSinceLiveAudio > 1200) {
       const mp3Base64 = await synthesizeTranslatedSpeechMp3Base64(
         translatedText || cleanOrig,
         targetLang
@@ -444,11 +480,11 @@ async function deliverTranslatedSpeechToListener(
           timestamp: Date.now(),
         });
       }
-    }, 500);
+    }
   } catch (e) {}
 }
 
-// Backup WAV transcriber using `gemini-3.8-flash` (as requested by Google's API response!)
+// Transcribe spoken WAV utterance using available Gemini Flash models for subtitles & fallback voice
 async function transcribeWavBufferAndDeliver(
   roomId,
   speaker,
@@ -460,44 +496,44 @@ async function transcribeWavBufferAndDeliver(
   const wavBase64 = wavBuf.toString("base64");
   const speakLangName = speaker?.speakLang || "en";
 
-  try {
-    const { GoogleGenAI } = await getGenAiSdk();
-    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  const { GoogleGenAI } = await getGenAiSdk();
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_FLASH_MODEL,
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              inlineData: {
-                mimeType: "audio/wav",
-                data: wavBase64,
+  for (const modelName of GEMINI_FLASH_MODELS) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  mimeType: "audio/wav",
+                  data: wavBase64,
+                },
               },
-            },
-            {
-              text: `Transcribe the exact human speech in this audio (language hint: ${speakLangName}). Return ONLY the plain spoken words, or empty string if silence/noise.`,
-            },
-          ],
-        },
-      ],
-    });
+              {
+                text: `Transcribe the exact human speech in this audio (language hint: ${speakLangName}). Return ONLY the plain spoken words, or empty string if silence/noise.`,
+              },
+            ],
+          },
+        ],
+      });
 
-    const transcript = String(response?.text || "").trim();
-    if (transcript && transcript.length > 1) {
-      await deliverTranslatedSpeechToListener(
-        roomId,
-        speaker,
-        listener,
-        transcript
-      );
+      const transcript = String(response?.text || "").trim();
+      if (transcript && transcript.length > 1) {
+        await deliverTranslatedSpeechToListener(
+          roomId,
+          speaker,
+          listener,
+          transcript
+        );
+      }
+      return;
+    } catch (err) {
+      // Try next Flash model in list if 404
     }
-  } catch (err) {
-    logTranslate(
-      "WAV_STT_WARN",
-      `WAV backup transcription skipped: ${err?.message || "error"}`
-    );
   }
 }
 
@@ -720,10 +756,10 @@ io.on("connection", (socket) => {
 
     if (speaker) {
       speaker.pcmChunkCounter = (speaker.pcmChunkCounter || 0) + 1;
-      if (speaker.pcmChunkCounter % 25 === 1 || rms > 0.015) {
+      if (speaker.pcmChunkCounter % 40 === 1 || rms > 0.012) {
         logTranslate(
           "MIC_PCM_IN",
-          `🎙️ Receiving 16kHz PCM from ${speaker.email} (chunk #${
+          `🎙️ 16kHz PCM from ${speaker.email} (chunk #${
             speaker.pcmChunkCounter
           }, rms: ${rms.toFixed(4)})`
         );
@@ -760,21 +796,19 @@ io.on("connection", (socket) => {
         }
       }
 
-      // 2. Parallel Server-Side VAD Utterance Buffer using `gemini-3.8-flash`
-      if (speaker && Date.now() - (speaker.lastTextTurnAt || 0) > 3500) {
-        if (rms > 0.012) {
+      // 2. Parallel VAD Utterance Buffer -> Guarantees Subtitles & Fallback Voice Audio!
+      if (speaker && Date.now() - (speaker.lastTextTurnAt || 0) > 3000) {
+        if (rms >= 0.008) {
           speaker.vadSpeaking = true;
           speaker.vadSilenceCount = 0;
           speaker.vadPcmBuffers.push(pcmBuf);
-          if (speaker.vadPcmBuffers.length >= 26) {
+          if (speaker.vadPcmBuffers.length >= 25) {
             const phrase = speaker.vadPcmBuffers.splice(
               0,
               speaker.vadPcmBuffers.length
             );
             speaker.vadSpeaking = false;
-            if (Date.now() - (listener.lastLiveAudioAt || 0) > 1400) {
-              transcribeWavBufferAndDeliver(roomId, speaker, listener, phrase);
-            }
+            transcribeWavBufferAndDeliver(roomId, speaker, listener, phrase);
           }
         } else if (speaker.vadSpeaking) {
           speaker.vadSilenceCount += 1;
@@ -786,10 +820,7 @@ io.on("connection", (socket) => {
             );
             speaker.vadSpeaking = false;
             speaker.vadSilenceCount = 0;
-            if (
-              phrase.length >= 4 &&
-              Date.now() - (listener.lastLiveAudioAt || 0) > 1400
-            ) {
+            if (phrase.length >= 3) {
               transcribeWavBufferAndDeliver(roomId, speaker, listener, phrase);
             }
           }
@@ -862,7 +893,6 @@ app.get("/", (req, res) => {
   res.status(200).json({
     server: "GeminiTranslateServer",
     model: GEMINI_LIVE_MODEL,
-    flashModel: GEMINI_FLASH_MODEL,
     status: "online",
     activeTranslateRooms: rooms.size,
     uptimeSeconds: Math.floor(process.uptime()),
