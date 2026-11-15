@@ -29,7 +29,8 @@ const GEMINI_API_KEY =
   "AQ.Ab8RN6J18Lri4K34bssqzHMCnIAzIQBVQsxfGW31jGH5qerzJQ";
 const GEMINI_LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
 
-const getGeminiWsUrl = (apiVersion = "v1alpha") =>
+// Official Gemini Live API BidiGenerateContent Endpoints (v1beta primary, v1alpha fallback)
+const getGeminiWsUrl = (apiVersion = "v1beta") =>
   `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
     GEMINI_API_KEY
   )}`;
@@ -51,30 +52,17 @@ function logTranslate(tag, msg, meta = null) {
 }
 
 // ============================================================================
-// ⚡ C++ SERVER-SIDE 24kHz -> 16kHz WAV BUILDER (ZERO MOBILE CPU OVERHEAD!)
+// 🔊 NATIVE 24kHz 16-BIT MONO LITTLE-ENDIAN WAV HEADER BUILDER (NO RESAMPLING!)
+// Preserves 100% of Gemini's native 24,000 Hz voice quality, pitch, and pacing
 // ============================================================================
-function resample24kTo16kPcm(pcm24kBuf) {
-  const inSamples = Math.floor(pcm24kBuf.length / 2);
-  const outSamples = Math.floor((inSamples * 2) / 3);
-  if (outSamples <= 0) return Buffer.alloc(0);
-
-  const outBuf = Buffer.allocUnsafe(outSamples * 2);
-  for (let i = 0; i < outSamples; i++) {
-    const srcIdx = Math.min(inSamples - 1, Math.floor(i * 1.5));
-    outBuf.writeInt16LE(pcm24kBuf.readInt16LE(srcIdx * 2), i * 2);
-  }
-  return outBuf;
-}
-
-function buildReadyWav16kBase64(pcm24kBuffers) {
-  const resampled = pcm24kBuffers.map((b) => resample24kTo16kPcm(b));
-  const pcmData = Buffer.concat(resampled);
-  const sampleRate = 16000;
+function buildNative24kWavBase64(pcm24kBuffers) {
+  const pcmData = Buffer.concat(pcm24kBuffers);
+  const sampleRate = 24000;
   const dataLen = pcmData.length;
   const totalSamples = Math.floor(dataLen / 2);
 
-  // 5ms fade-in/out (80 samples) for click-free transitions
-  const fadeSamples = Math.min(80, Math.floor(totalSamples / 10));
+  // 4ms micro fade-in/out (96 samples at 24kHz) to prevent boundary clicks between chunks
+  const fadeSamples = Math.min(96, Math.floor(totalSamples / 12));
   for (let i = 0; i < fadeSamples; i++) {
     const gain = i / fadeSamples;
     const firstIdx = i * 2;
@@ -97,10 +85,10 @@ function buildReadyWav16kBase64(pcm24kBuffers) {
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20); // PCM = 1
   header.writeUInt16LE(1, 22); // Mono = 1
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28); // 32,000 bytes/sec
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
+  header.writeUInt32LE(sampleRate, 24); // 24,000 Hz
+  header.writeUInt32LE(sampleRate * 2, 28); // 48,000 bytes/sec
+  header.writeUInt16LE(2, 32); // BlockAlign = 2
+  header.writeUInt16LE(16, 34); // 16-bit
   header.write("data", 36);
   header.writeUInt32LE(dataLen, 40);
 
@@ -125,7 +113,7 @@ function calculatePcmBufferRms(pcmBuf) {
 }
 
 // ============================================================================
-// 🗂️ IN-MEMORY ROOM & CONTINUOUS SESSION STORE
+// 🗂️ IN-MEMORY ROOM & BIDIRECTIONAL SESSION STORE
 // ============================================================================
 const rooms = new Map();
 const socketToMeta = new Map();
@@ -152,12 +140,13 @@ function closeListenerGeminiSession(participant) {
 }
 
 // ============================================================================
-// ⚡ OFFICIAL GOOGLE AI STUDIO GEMINI 3.5 LIVE TRANSLATE SESSION
+// ⚡ GOOGLE AI STUDIO LIVE TRANSLATE SESSION (CONTINUOUS 16kHz IN -> 24kHz OUT)
+// Official Spec: https://ai.google.dev/gemini-api/docs/live-api/live-translate
 // ============================================================================
 function ensureListenerGeminiSession(
   roomId,
   listenerKey,
-  apiVersion = "v1alpha"
+  apiVersion = "v1beta"
 ) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -199,7 +188,7 @@ function ensureListenerGeminiSession(
   const wsUrl = getGeminiWsUrl(apiVersion);
   logTranslate(
     "WS_CONNECTING",
-    `Connecting ${GEMINI_LIVE_MODEL} (${apiVersion}) for ${listener.email}`,
+    `Connecting ${GEMINI_LIVE_MODEL} (${apiVersion}) for listener ${listener.email}`,
     { roomId, targetLanguageCode: targetLang }
   );
 
@@ -213,10 +202,12 @@ function ensureListenerGeminiSession(
   let currentInputText = "";
   let currentOutputText = "";
   let lastTranscriptAt = 0;
+  let isFirstBurstOfSpeech = true;
 
-  // Coalesces 2-3 chunks (~500ms-750ms) on the server into a ready-to-play WAV
-  // so the mobile phone's JS thread does ZERO Base64 decoding/re-encoding!
-  const flushServerWavToClient = () => {
+  // PROGRESSIVE STREAMING DISPATCHER:
+  // - Dispatches the VERY FIRST chunk of a speech stream immediately (1 chunk = ~250ms) so the listener hears translation start right away!
+  // - Dispatches follow-up chunks in 2-chunk (~500ms) 24kHz buffers so the phone pre-loads them with 0ms gap!
+  const flush24kAudioStreamToListener = () => {
     if (listener.outFlushTimer) {
       clearTimeout(listener.outFlushTimer);
       listener.outFlushTimer = null;
@@ -234,17 +225,21 @@ function ensureListenerGeminiSession(
       0,
       listener.outPcm24kBuffers.length
     );
-    const { wavBase64, durationMs } = buildReadyWav16kBase64(chunks);
-    if (durationMs < 120) return;
+    const { wavBase64, durationMs } = buildNative24kWavBase64(chunks);
+    if (durationMs < 80) return;
 
+    isFirstBurstOfSpeech = false;
     const seq = ++listener.audioSeq;
+
+    // Echo Guard: Prevent listener's loudspeaker from feeding back into their mic while playing
     listener.ignoreMicUntil =
-      Math.max(Date.now(), listener.ignoreMicUntil || 0) + durationMs + 300;
+      Math.max(Date.now(), listener.ignoreMicUntil || 0) + durationMs + 220;
 
     io.to(listener.socketId).emit("translated_audio_chunk", {
       roomId,
       seq,
       wavBase64,
+      sampleRate: 24000,
       durationMs,
       originalText: currentInputText || null,
       translatedText: currentOutputText || null,
@@ -256,6 +251,11 @@ function ensureListenerGeminiSession(
   ws.on("open", () => {
     listener.isConnecting = false;
 
+    // Exact Official Setup Configuration from https://ai.google.dev/gemini-api/docs/live-api/live-translate
+    // - No artificial systemInstruction that conflicts with native automatic language detection
+    // - responseModalities: ["AUDIO"]
+    // - translationConfig: { targetLanguageCode, echoTargetLanguage: false }
+    // - inputAudioTranscription: {} & outputAudioTranscription: {} for synchronized live captions
     const setupMessage = {
       setup: {
         model: GEMINI_LIVE_MODEL,
@@ -285,6 +285,7 @@ function ensureListenerGeminiSession(
         : String(rawData);
       const response = JSON.parse(jsonStr);
 
+      // 1. Setup Complete Handshake -> Flush any buffered 100ms input chunks immediately
       if (response.setupComplete !== undefined) {
         listener.isSetupComplete = true;
         logTranslate(
@@ -312,8 +313,10 @@ function ensureListenerGeminiSession(
       const sc = response.serverContent;
       if (!sc) return;
 
+      // 2. Native Stream Interruption -> Clear obsolete playback audio on client
       if (sc.interrupted) {
         listener.outPcm24kBuffers = [];
+        isFirstBurstOfSpeech = true;
         if (listener.outFlushTimer) {
           clearTimeout(listener.outFlushTimer);
           listener.outFlushTimer = null;
@@ -325,9 +328,11 @@ function ensureListenerGeminiSession(
       }
 
       const nowMs = Date.now();
-      if (lastTranscriptAt > 0 && nowMs - lastTranscriptAt > 1400) {
+      // Only start a fresh caption block if the speaker paused for more than 3.5 seconds
+      if (lastTranscriptAt > 0 && nowMs - lastTranscriptAt > 3500) {
         currentInputText = "";
         currentOutputText = "";
+        isFirstBurstOfSpeech = true;
       }
 
       let hasTextUpdate = false;
@@ -337,7 +342,7 @@ function ensureListenerGeminiSession(
         currentInputText = `${currentInputText} ${sc.inputTranscription.text}`
           .replace(/\s+/g, " ")
           .trim()
-          .slice(-85);
+          .slice(-140);
       }
       if (sc.outputTranscription?.text) {
         lastTranscriptAt = nowMs;
@@ -346,28 +351,30 @@ function ensureListenerGeminiSession(
           `${currentOutputText} ${sc.outputTranscription.text}`
             .replace(/\s+/g, " ")
             .trim()
-            .slice(-85);
+            .slice(-140);
       }
 
+      // 3. Incremental 24kHz PCM Audio Output Forwarding (Do NOT wait for turnComplete!)
       const parts = sc.modelTurn?.parts || [];
       for (const part of parts) {
         if (part?.inlineData?.data) {
           const pcmBuf = Buffer.from(part.inlineData.data, "base64");
           const outRms = calculatePcmBufferRms(pcmBuf);
 
-          // Ignore digital 0.0000 silence frames
-          if (outRms >= 0.0035) {
+          // Skip 0x0000 digital silence idle ticks; forward all real speech immediately
+          if (outRms >= 0.0025) {
             listener.outPcm24kBuffers.push(pcmBuf);
 
-            // Flush every 3 chunks (~750ms) OR 320ms after the last chunk in a burst!
-            // Sends at most ~1-2 ready WAV packets per second so the phone's JS thread never lags!
-            if (listener.outPcm24kBuffers.length >= 3) {
-              flushServerWavToClient();
+            // First burst of speech dispatches on the very first chunk (1 chunk = ~250ms) for instant voice start!
+            // Subsequent bursts dispatch every 2 chunks (~500ms) for smooth pre-loaded playback!
+            const targetChunks = isFirstBurstOfSpeech ? 1 : 2;
+            if (listener.outPcm24kBuffers.length >= targetChunks) {
+              flush24kAudioStreamToListener();
             } else {
               clearTimeout(listener.outFlushTimer);
               listener.outFlushTimer = setTimeout(() => {
-                flushServerWavToClient();
-              }, 320);
+                flush24kAudioStreamToListener();
+              }, 120);
             }
           }
         }
@@ -377,15 +384,15 @@ function ensureListenerGeminiSession(
           currentOutputText = `${currentOutputText} ${part.text.trim()}`
             .replace(/\s+/g, " ")
             .trim()
-            .slice(-85);
+            .slice(-140);
         }
       }
 
-      // Throttle subtitle socket emissions to at most once every 300ms
+      // Emit synchronized live transcripts (throttled to 220ms so React Native UI stays 60FPS)
       if (
         hasTextUpdate &&
         (currentInputText || currentOutputText) &&
-        nowMs - (listener.lastSubtitleEmitAt || 0) >= 300
+        nowMs - (listener.lastSubtitleEmitAt || 0) >= 220
       ) {
         listener.lastSubtitleEmitAt = nowMs;
         io.to(listener.socketId).emit("translated_subtitle", {
@@ -398,7 +405,8 @@ function ensureListenerGeminiSession(
       }
 
       if (sc.turnComplete || sc.generationComplete) {
-        flushServerWavToClient();
+        flush24kAudioStreamToListener();
+        isFirstBurstOfSpeech = true;
         if (currentInputText || currentOutputText) {
           io.to(listener.socketId).emit("translated_subtitle", {
             roomId,
@@ -408,20 +416,28 @@ function ensureListenerGeminiSession(
             isFinal: true,
           });
         }
-        currentInputText = "";
-        currentOutputText = "";
+        io.to(listener.socketId).emit("translated_turn_complete", {
+          roomId,
+          targetLang,
+          timestamp: Date.now(),
+        });
       }
     } catch (e) {}
   });
 
   ws.on("error", (err) => {
     listener.isConnecting = false;
+    const msg = String(err?.message || "");
     logTranslate(
       "WS_ERROR",
-      `WebSocket error (${apiVersion}) for ${listener.email}: ${
-        err?.message || "error"
-      }`
+      `WebSocket error (${apiVersion}) for ${listener.email}: ${msg}`
     );
+    // Automatic fallback from v1beta to v1alpha if endpoint returns 404
+    if (apiVersion === "v1beta" && msg.includes("404")) {
+      listener.useV1Alpha = true;
+      listener.lastConnectAttemptAt = 0;
+      ensureListenerGeminiSession(roomId, listenerKey, "v1alpha");
+    }
   });
 
   ws.on("close", () => {
@@ -438,16 +454,19 @@ function ensureListenerGeminiSession(
 }
 
 // ============================================================================
-// 📤 STREAM CONTINUOUS 16kHz PCM TO LISTENER'S GEMINI LIVE SESSION
+// 📤 CONTINUOUS 100ms 16kHz PCM STREAMING TO GEMINI LIVE API
+// Spec: { "realtimeInput": { "audio": { "data": pcmBase64, "mimeType": "audio/pcm;rate=16000" } } }
 // ============================================================================
 function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
   if (!listener || !listener.translatorEnabled || !listener.hasMinutes) return;
 
+  const preferredVersion = listener.useV1Alpha ? "v1alpha" : "v1beta";
+
   if (!listener.geminiWs || listener.geminiWs.readyState > WebSocket.OPEN) {
-    if (listener.pendingInputQueue.length < 10) {
+    if (listener.pendingInputQueue.length < 12) {
       listener.pendingInputQueue.push(pcmBase64);
     }
-    ensureListenerGeminiSession(roomId, listenerKey, "v1alpha");
+    ensureListenerGeminiSession(roomId, listenerKey, preferredVersion);
     return;
   }
 
@@ -467,6 +486,8 @@ function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
         })
       );
     } catch (e) {}
+  } else if (listener.pendingInputQueue.length < 12) {
+    listener.pendingInputQueue.push(pcmBase64);
   }
 }
 
@@ -515,9 +536,6 @@ io.on("connection", (socket) => {
     if (!rooms.has(roomId)) {
       rooms.set(roomId, {
         participants: new Map(),
-        activeSpeakerKey: null,
-        activeSpeakerRms: 0,
-        floorLockUntil: 0,
       });
     }
     const room = rooms.get(roomId);
@@ -535,6 +553,7 @@ io.on("connection", (socket) => {
       isSetupComplete: false,
       sessionTargetLang: null,
       isConnecting: false,
+      useV1Alpha: false,
       lastConnectAttemptAt: 0,
       lastSubtitleEmitAt: 0,
       ignoreMicUntil: 0,
@@ -556,7 +575,11 @@ io.on("connection", (socket) => {
     broadcastRoomTranslateState(roomId);
 
     if (participant.translatorEnabled && participant.hasMinutes) {
-      ensureListenerGeminiSession(roomId, emailKey, "v1alpha");
+      ensureListenerGeminiSession(
+        roomId,
+        emailKey,
+        participant.useV1Alpha ? "v1alpha" : "v1beta"
+      );
     } else {
       closeListenerGeminiSession(participant);
     }
@@ -615,13 +638,17 @@ io.on("connection", (socket) => {
         closeListenerGeminiSession(participant);
         participant.lastConnectAttemptAt = 0;
       }
-      ensureListenerGeminiSession(roomId, emailKey, "v1alpha");
+      ensureListenerGeminiSession(
+        roomId,
+        emailKey,
+        participant.useV1Alpha ? "v1alpha" : "v1beta"
+      );
     } else {
       closeListenerGeminiSession(participant);
     }
   });
 
-  // 3. CONTINUOUS 16kHz PCM STREAMING
+  // 3. CONTINUOUS 100ms 16kHz PCM STREAMING (Two Independent Sessions: A -> B and B -> A)
   socket.on("stream_mic_pcm_16k", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -635,36 +662,12 @@ io.on("connection", (socket) => {
     const speaker = room.participants.get(speakerKey);
     if (!speaker) return;
 
-    const now = Date.now();
-    if (now < (speaker.ignoreMicUntil || 0)) {
+    // Echo Guard: Do not forward speaker's mic while their loudspeaker is playing translated audio
+    if (Date.now() < (speaker.ignoreMicUntil || 0)) {
       return;
     }
 
-    let rms = 0;
-    try {
-      const pcmBuf = Buffer.from(pcmBase64, "base64");
-      rms = calculatePcmBufferRms(pcmBuf);
-    } catch (e) {
-      return;
-    }
-
-    // Dominant-Speaker Crosstalk Lock
-    if (
-      room.activeSpeakerKey &&
-      room.activeSpeakerKey !== speakerKey &&
-      now < (room.floorLockUntil || 0)
-    ) {
-      if (rms < (room.activeSpeakerRms || 0.03) * 1.6) {
-        return;
-      }
-    }
-
-    if (rms >= 0.014) {
-      room.activeSpeakerKey = speakerKey;
-      room.activeSpeakerRms = rms;
-      room.floorLockUntil = now + 450;
-    }
-
+    // Forward Speaker's 100ms 16kHz PCM chunk directly into Listener's dedicated Gemini session
     for (const [listenerKey, listener] of room.participants.entries()) {
       if (listenerKey === speakerKey) continue;
       if (!listener.translatorEnabled || !listener.hasMinutes) continue;
