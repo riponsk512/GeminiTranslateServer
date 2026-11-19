@@ -18,8 +18,8 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   maxHttpBufferSize: 1e7,
-  pingInterval: 3000,
-  pingTimeout: 6000,
+  pingInterval: 5000,
+  pingTimeout: 12000,
   transports: ["websocket", "polling"],
 });
 
@@ -32,8 +32,8 @@ const GEMINI_LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
 // Pure digital 128ms zero-silence frame at 16kHz 16-bit mono (4096 zero bytes)
 const SILENT_PCM_128MS_B64 = Buffer.alloc(4096).toString("base64");
 
-// Official Gemini Live API BidiGenerateContent endpoint (v1beta primary, v1alpha fallback)
-const getGeminiWsUrl = (apiVersion = "v1beta") =>
+// Direct v1alpha connection (avoids 404 fallback delay on every connect)
+const getGeminiWsUrl = (apiVersion = "v1alpha") =>
   `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
     GEMINI_API_KEY
   )}`;
@@ -55,16 +55,35 @@ function logTranslate(tag, msg, meta = null) {
 }
 
 // ============================================================================
-// 🔊 NATIVE 24,000 Hz 16-BIT MONO LITTLE-ENDIAN WAV BUILDER (NO RESAMPLING!)
-// Preserves 100% of Gemini's natural voice pitch, speed, and clarity
+// 🔊 24kHz -> 16kHz CLEAN INTERPOLATED WAV BUILDER (33% SMALLER = FASTER DELIVERY)
 // ============================================================================
-function buildNative24kWav(pcm24kBuffers) {
-  const pcmData = Buffer.concat(pcm24kBuffers);
-  const sampleRate = 24000;
+function resample24kTo16kPcm(pcm24kBuf) {
+  const inSamples = Math.floor(pcm24kBuf.length / 2);
+  const outSamples = Math.floor((inSamples * 2) / 3);
+  if (outSamples <= 0) return Buffer.alloc(0);
+
+  const outBuf = Buffer.allocUnsafe(outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    const srcPos = i * 1.5;
+    const idx0 = Math.floor(srcPos);
+    const frac = srcPos - idx0;
+    const idx1 = Math.min(inSamples - 1, idx0 + 1);
+    const s0 = pcm24kBuf.readInt16LE(idx0 * 2);
+    const s1 = pcm24kBuf.readInt16LE(idx1 * 2);
+    const sample = Math.round(s0 + (s1 - s0) * frac);
+    outBuf.writeInt16LE(sample, i * 2);
+  }
+  return outBuf;
+}
+
+function buildFastWav16k(pcm24kBuffers) {
+  const resampled = pcm24kBuffers.map((b) => resample24kTo16kPcm(b));
+  const pcmData = Buffer.concat(resampled);
+  const sampleRate = 16000;
   const dataLen = pcmData.length;
   const totalSamples = Math.floor(dataLen / 2);
 
-  // 2ms soft edge fade (48 samples at 24kHz) so audio never clicks
+  // 3ms soft edge fade (48 samples at 16kHz) so consecutive bursts blend without clicks
   const fadeSamples = Math.min(48, Math.floor(totalSamples / 16));
   for (let i = 0; i < fadeSamples; i++) {
     const gain = i / fadeSamples;
@@ -88,10 +107,10 @@ function buildNative24kWav(pcm24kBuffers) {
   header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20); // PCM = 1
   header.writeUInt16LE(1, 22); // Mono = 1
-  header.writeUInt32LE(sampleRate, 24); // 24,000 Hz
-  header.writeUInt32LE(sampleRate * 2, 28); // 48,000 bytes/sec
-  header.writeUInt16LE(2, 32); // BlockAlign = 2
-  header.writeUInt16LE(16, 34); // BitsPerSample = 16
+  header.writeUInt32LE(sampleRate, 24); // 16,000 Hz
+  header.writeUInt32LE(sampleRate * 2, 28); // 32,000 bytes/sec
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
   header.write("data", 36);
   header.writeUInt32LE(dataLen, 40);
 
@@ -159,12 +178,12 @@ function closeListenerGeminiSession(participant) {
 }
 
 // ============================================================================
-// ⚡ PERSISTENT GEMINI 3.5 LIVE TRANSLATE SESSION (UNBROKEN FULL PHRASES)
+// ⚡ FAST PROGRESSIVE GEMINI 3.5 LIVE TRANSLATE SESSION (750ms FIRST BURST!)
 // ============================================================================
 function ensureListenerGeminiSession(
   roomId,
   listenerKey,
-  apiVersion = "v1beta"
+  apiVersion = "v1alpha"
 ) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -225,9 +244,9 @@ function ensureListenerGeminiSession(
   let currentInputText = "";
   let currentOutputText = "";
   let silentOutTicks = 0;
+  let isFirstBurstOfTurn = true;
   let currentTurnId = `turn_${Date.now()}`;
 
-  // Sends ONE unbroken 24kHz WAV for the entire spoken phrase so audio never breaks!
   const flushPhraseWav = (isTurnEnd = false) => {
     if (listener.outFlushTimer) {
       clearTimeout(listener.outFlushTimer);
@@ -247,20 +266,21 @@ function ensureListenerGeminiSession(
         0,
         listener.outPcm24kBuffers.length
       );
-      const { wavBuffer, durationMs } = buildNative24kWav(chunks);
+      const { wavBuffer, durationMs } = buildFastWav16k(chunks);
 
-      if (durationMs >= 120) {
+      if (durationMs >= 110) {
+        isFirstBurstOfTurn = false;
         const seq = ++listener.audioSeq;
 
-        // Echo Shield: Block listener's mic while their loudspeaker plays this phrase (+ 300ms tail)
+        // Echo Shield: Block listener's mic while their loudspeaker plays this burst (+ 250ms tail)
         listener.ignoreMicUntil =
           Math.max(Date.now(), listener.ignoreMicUntil || 0) +
           durationMs +
-          300;
+          250;
 
         logTranslate(
-          "PHRASE_WAV_SENT",
-          `🔊 Sent smooth 24kHz WAV #${seq} (${durationMs}ms, ${chunks.length} chunks, ->${targetLang}) to ${listener.email}`,
+          "FAST_WAV_SENT",
+          `🔊 Sent 16kHz WAV #${seq} (${durationMs}ms, ${chunks.length} chunks, ->${targetLang}) to ${listener.email}`,
           { text: cleanTrans || cleanOrig }
         );
 
@@ -271,7 +291,7 @@ function ensureListenerGeminiSession(
           seq,
           wavBase64: wavBuffer.toString("base64"),
           audioFormat: "wav",
-          sampleRate: 24000,
+          sampleRate: 16000,
           durationMs,
           originalText: sendSubtitles && cleanOrig ? cleanOrig : null,
           translatedText: sendSubtitles && cleanTrans ? cleanTrans : null,
@@ -295,6 +315,7 @@ function ensureListenerGeminiSession(
       currentInputText = "";
       currentOutputText = "";
       silentOutTicks = 0;
+      isFirstBurstOfTurn = true;
       currentTurnId = `turn_${Date.now()}_${Math.random()
         .toString(36)
         .substring(2, 5)}`;
@@ -305,7 +326,6 @@ function ensureListenerGeminiSession(
     if (listener.geminiWs !== ws) return;
     listener.isConnecting = false;
 
-    // Clean official Google AI Studio Live Translate setup (no conflicting prompts)
     const setupMessage = {
       setup: {
         model: GEMINI_LIVE_MODEL,
@@ -368,6 +388,7 @@ function ensureListenerGeminiSession(
         currentInputText = "";
         currentOutputText = "";
         silentOutTicks = 0;
+        isFirstBurstOfTurn = true;
         if (listener.outFlushTimer) {
           clearTimeout(listener.outFlushTimer);
           listener.outFlushTimer = null;
@@ -413,23 +434,22 @@ function ensureListenerGeminiSession(
             silentOutTicks = 0;
             listener.outPcm24kBuffers.push(outBuf);
 
-            // Allow up to 12 chunks (~3.0s) in a single WAV so full sentences play smoothly without breaking!
-            // As soon as Gemini pauses for 360ms or sends 2 silent ticks, flush immediately!
-            if (listener.outPcm24kBuffers.length >= 12) {
+            // FAST START: Flush first burst at 3 chunks (~750ms) so voice starts speaking immediately!
+            // Continuation bursts flush at 4 chunks (~1000ms) while client pre-loads them seamlessly!
+            const targetChunks = isFirstBurstOfTurn ? 3 : 4;
+            if (listener.outPcm24kBuffers.length >= targetChunks) {
               flushPhraseWav(false);
             } else {
               clearTimeout(listener.outFlushTimer);
               listener.outFlushTimer = setTimeout(() => {
                 flushPhraseWav(true);
-              }, 360);
+              }, 240);
             }
           } else if (listener.outPcm24kBuffers.length > 0) {
             silentOutTicks += 1;
             if (silentOutTicks === 1) {
-              // Keep 1 brief silence chunk for natural pacing inside a sentence
               listener.outPcm24kBuffers.push(outBuf);
             } else {
-              // 2 consecutive silent chunks -> phrase finished! Flush complete phrase now!
               flushPhraseWav(true);
             }
           }
@@ -462,7 +482,7 @@ function ensureListenerGeminiSession(
         listener.captionResetTimer = setTimeout(() => {
           currentInputText = "";
           currentOutputText = "";
-        }, 1800);
+        }, 1600);
       }
 
       if (sc.turnComplete || sc.generationComplete) {
@@ -474,16 +494,12 @@ function ensureListenerGeminiSession(
   ws.on("error", (err) => {
     if (listener.geminiWs !== ws) return;
     listener.isConnecting = false;
-    const msg = String(err?.message || "");
     logTranslate(
       "WS_ERROR",
-      `WebSocket error (${apiVersion}) for ${listener.email}: ${msg}`
+      `WebSocket error (${apiVersion}) for ${listener.email}: ${
+        err?.message || "error"
+      }`
     );
-    if (apiVersion === "v1beta" && msg.includes("404")) {
-      listener.useV1Alpha = true;
-      listener.lastConnectAttemptAt = 0;
-      ensureListenerGeminiSession(roomId, listenerKey, "v1alpha");
-    }
   });
 
   ws.on("close", (code) => {
@@ -508,13 +524,11 @@ function ensureListenerGeminiSession(
 function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
   if (!listener || !listener.translatorEnabled || !listener.hasMinutes) return;
 
-  const preferredVersion = listener.useV1Alpha ? "v1alpha" : "v1beta";
-
   if (!listener.geminiWs || listener.geminiWs.readyState > WebSocket.OPEN) {
-    if (listener.pendingInputQueue.length < 12) {
+    if (listener.pendingInputQueue.length < 10) {
       listener.pendingInputQueue.push(pcmBase64);
     }
-    ensureListenerGeminiSession(roomId, listenerKey, preferredVersion);
+    ensureListenerGeminiSession(roomId, listenerKey, "v1alpha");
     return;
   }
 
@@ -534,7 +548,7 @@ function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
         })
       );
     } catch (e) {}
-  } else if (listener.pendingInputQueue.length < 12) {
+  } else if (listener.pendingInputQueue.length < 10) {
     listener.pendingInputQueue.push(pcmBase64);
   }
 }
@@ -548,9 +562,8 @@ function sendSilenceEndTrigger(listener) {
     return;
   }
   try {
-    // 3 frames (~384ms) of pure digital 0x00 silence cleanly tells Gemini's VAD the sentence ended
-    // WITHOUT closing the continuous Live session!
-    for (let i = 0; i < 3; i++) {
+    // 2 frames (~256ms) of pure digital 0x00 silence signals end-of-phrase quickly
+    for (let i = 0; i < 2; i++) {
       listener.geminiWs.send(
         JSON.stringify({
           realtimeInput: {
@@ -633,7 +646,6 @@ io.on("connection", (socket) => {
       isSetupComplete: false,
       sessionTargetLang: null,
       isConnecting: false,
-      useV1Alpha: false,
       lastConnectAttemptAt: 0,
       ignoreMicUntil: 0,
       lastInSeqReceived: 0,
@@ -661,11 +673,7 @@ io.on("connection", (socket) => {
     broadcastRoomTranslateState(roomId);
 
     if (participant.translatorEnabled && participant.hasMinutes) {
-      ensureListenerGeminiSession(
-        roomId,
-        emailKey,
-        participant.useV1Alpha ? "v1alpha" : "v1beta"
-      );
+      ensureListenerGeminiSession(roomId, emailKey, "v1alpha");
     } else {
       closeListenerGeminiSession(participant);
     }
@@ -737,11 +745,7 @@ io.on("connection", (socket) => {
         closeListenerGeminiSession(participant);
         participant.lastConnectAttemptAt = 0;
       }
-      ensureListenerGeminiSession(
-        roomId,
-        emailKey,
-        participant.useV1Alpha ? "v1alpha" : "v1beta"
-      );
+      ensureListenerGeminiSession(roomId, emailKey, "v1alpha");
     } else {
       closeListenerGeminiSession(participant);
     }
@@ -770,7 +774,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Gentle 0.008 Speech Gate: catches normal & soft voices reliably while blocking idle static!
   socket.on("stream_mic_pcm_16k", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -826,10 +829,10 @@ io.on("connection", (socket) => {
     if (rms >= 0.008) {
       room.activeSpeakerKey = speakerKey;
       room.activeSpeakerRms = rms;
-      room.floorLockUntil = now + 450;
+      room.floorLockUntil = now + 400;
 
-      // 5 chunks (~640ms) of hangover keeps natural mid-sentence pauses inside the same stream!
-      speaker.hangoverLeft = 5;
+      // 3 chunks (~384ms) hangover -> fast end-of-phrase detection without clipping words!
+      speaker.hangoverLeft = 3;
       speaker.wasSpeaking = true;
 
       for (const [listenerKey, listener] of room.participants.entries()) {
@@ -859,11 +862,7 @@ io.on("connection", (socket) => {
         sendSilenceEndTrigger(listener);
       }
     } else {
-      // Keep 2 chunks (~256ms) of pre-roll so the first syllable is never cut off
-      speaker.preRollChunks.push(pcmBase64);
-      if (speaker.preRollChunks.length > 2) {
-        speaker.preRollChunks.shift();
-      }
+      speaker.preRollChunks = [pcmBase64];
     }
   });
 
