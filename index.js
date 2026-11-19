@@ -91,7 +91,8 @@ function logTranslate(tag, msg, meta = null) {
 }
 
 // ============================================================================
-// 🔊 24kHz -> 16kHz SMOOTH INTERPOLATED WAV BUILDER (LIGHTWEIGHT FOR VIDEO CALLS)
+// 🔊 24kHz -> 16kHz SMOOTH INTERPOLATED WAV BUILDER
+// Matches Android MODE_IN_COMMUNICATION 16kHz wideband mixer natively!
 // ============================================================================
 function resample24kTo16kPcm(pcm24kBuf) {
   const inSamples = Math.floor(pcm24kBuf.length / 2);
@@ -119,7 +120,7 @@ function buildFastBurstWav16k(pcm24kBuffers) {
   const dataLen = pcmData.length;
   const totalSamples = Math.floor(dataLen / 2);
 
-  // 4ms fade-in/out (64 samples at 16kHz) so consecutive bursts join without clicks
+  // 4ms fade-in/out (64 samples at 16kHz) for click-free transitions
   const fadeSamples = Math.min(64, Math.floor(totalSamples / 14));
   for (let i = 0; i < fadeSamples; i++) {
     const gain = i / fadeSamples;
@@ -141,10 +142,10 @@ function buildFastBurstWav16k(pcm24kBuffers) {
   header.write("WAVE", 8);
   header.write("fmt ", 12);
   header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20); // PCM = 1
-  header.writeUInt16LE(1, 22); // Mono = 1
-  header.writeUInt32LE(sampleRate, 24); // 16,000 Hz
-  header.writeUInt32LE(sampleRate * 2, 28); // 32,000 bytes/sec
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
   header.writeUInt16LE(2, 32);
   header.writeUInt16LE(16, 34);
   header.write("data", 36);
@@ -213,7 +214,7 @@ function closeAllParticipantSessions(participant) {
 }
 
 // ============================================================================
-// ⚡ SINGLE-UTTERANCE GEMINI SESSION FACTORY (FAST 750ms START + ZERO OLD MEMORY)
+// ⚡ SINGLE-UTTERANCE GEMINI SESSION FACTORY (500ms INSTANT START + ZERO REPEAT)
 // ============================================================================
 function createFreshGeminiSession(roomId, listenerKey, listener) {
   const room = rooms.get(roomId);
@@ -280,15 +281,15 @@ function createFreshGeminiSession(roomId, listenerKey, listener) {
       );
       const { wavBuffer, durationMs } = buildFastBurstWav16k(chunks);
 
-      if (durationMs >= 120) {
+      if (durationMs >= 100) {
         sess.hasFlushedFirstBurst = true;
         const seq = ++listener.audioSeq;
 
-        // Echo Shield: Block listener's mic while their loudspeaker plays this burst (+ 320ms tail)
+        // Echo Shield: Block listener's mic while their loudspeaker plays this burst (+ 280ms tail)
         listener.ignoreMicUntil =
           Math.max(Date.now(), listener.ignoreMicUntil || 0) +
           durationMs +
-          320;
+          280;
 
         logTranslate(
           "VOICE_WAV_SENT",
@@ -420,7 +421,7 @@ function createFreshGeminiSession(roomId, listenerKey, listener) {
         }
       }
 
-      // ⚡ PROGRESSIVE AUDIO STREAMING (NEVER WAITS 4000ms FOR SILENT TICKS!)
+      // ⚡ FAST PROGRESSIVE AUDIO STREAMING (2-CHUNK ~500ms FIRST BURST!)
       const parts = sc.modelTurn?.parts || [];
       for (const part of parts) {
         if (
@@ -428,33 +429,28 @@ function createFreshGeminiSession(roomId, listenerKey, listener) {
           listener.translateMode !== "text_only"
         ) {
           const outBuf = Buffer.from(part.inlineData.data, "base64");
-          // Always measure true RMS on every chunk so Gemini's 0.0000 idle silence never stalls flushing!
           const outRms = calculatePcmBufferRms(outBuf);
 
-          if (outRms >= 0.003) {
-            // Audible translated speech chunk!
+          if (outRms >= 0.0028) {
             sess.silentOutTicks = 0;
             sess.outPcm24kBuffers.push(outBuf);
 
-            // First burst of sentence flushes at 3 chunks (~750ms) so voice starts speaking IMMEDIATELY!
-            // Subsequent bursts in the same sentence flush at 5 chunks (~1250ms) for smooth playback!
-            const targetChunks = sess.hasFlushedFirstBurst ? 5 : 3;
+            // First burst flushes at 2 chunks (~500ms) for near-instant speech onset;
+            // subsequent bursts in the same sentence flush at 4 chunks (~1000ms) for seamless continuity!
+            const targetChunks = sess.hasFlushedFirstBurst ? 4 : 2;
             if (sess.outPcm24kBuffers.length >= targetChunks) {
               flushUtteranceWav(false);
             } else {
               clearTimeout(sess.flushTimer);
               sess.flushTimer = setTimeout(() => {
                 flushUtteranceWav(sess.isDraining);
-              }, 300);
+              }, 260);
             }
           } else if (sess.outPcm24kBuffers.length > 0) {
-            // Gemini emitted a 0.0000 silent chunk AFTER speaking!
             sess.silentOutTicks += 1;
             if (sess.silentOutTicks === 1) {
-              // Keep 1 silent chunk (250ms) as natural word spacing, but DO NOT reset flushTimer
               sess.outPcm24kBuffers.push(outBuf);
             } else {
-              // 2 consecutive silent chunks from Gemini = phrase is finished! Flush immediately!
               flushUtteranceWav(sess.isDraining);
             }
           }
@@ -506,7 +502,6 @@ function createFreshGeminiSession(roomId, listenerKey, listener) {
     }
   });
 
-  // Expose flush helper so drainKillTimer can flush before closing
   sess.forceFlushAndClose = () => flushUtteranceWav(true);
 
   return sess;
@@ -602,7 +597,7 @@ function finalizeCurrentUtteranceAndRotateSession(
     currentSess.isSetupComplete
   ) {
     try {
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 2; i++) {
         currentSess.ws.send(
           JSON.stringify({
             realtimeInput: {
@@ -624,12 +619,12 @@ function finalizeCurrentUtteranceAndRotateSession(
     } catch (e) {}
   }
 
-  // CRITICAL FIX: Always flush any remaining buffered audio before closing the draining session!
+  // Always flush remaining buffered audio before closing the draining session
   currentSess.drainKillTimer = setTimeout(() => {
     if (!currentSess.closed) {
       currentSess.forceFlushAndClose?.();
     }
-  }, 2200);
+  }, 2400);
 
   listener.activeSession = null;
   promoteStandbySession(roomId, listenerKey, listener);
@@ -690,7 +685,6 @@ function broadcastRoomTranslateState(roomId) {
 io.on("connection", (socket) => {
   logTranslate("SOCKET_CONNECT", `Client connected: ${socket.id}`);
 
-  // 1. JOIN / SYNC TRANSLATE ROOM
   socket.on("join_translate_room", (payload) => {
     const {
       roomId,
@@ -764,7 +758,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 2. UPDATE TRANSLATE CONFIG
   socket.on("update_translate_config", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -842,7 +835,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 3. IMMEDIATE MIC-MUTE FLUSH & SESSION ROTATION
   socket.on("flush_muted_mic", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -866,7 +858,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 4. FULL-SENTENCE UTTERANCE STREAMING + HOT-STANDBY ROTATION
   socket.on("stream_mic_pcm_16k", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -919,13 +910,13 @@ io.on("connection", (socket) => {
       }
     }
 
-    if (rms >= 0.015) {
+    if (rms >= 0.014) {
       room.activeSpeakerKey = speakerKey;
       room.activeSpeakerRms = rms;
-      room.floorLockUntil = now + 450;
+      room.floorLockUntil = now + 420;
 
-      // 4 chunks (~750ms at 180ms interval) of natural word-pause hangover
-      speaker.hangoverLeft = 4;
+      // 3 chunks (~384ms at 128ms per chunk) -> fast sentence end detection without chopping words!
+      speaker.hangoverLeft = 3;
       speaker.isInActiveUtterance = true;
 
       for (const [listenerKey, listener] of room.participants.entries()) {
@@ -963,7 +954,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 5. DIRECT PARTNER PCM FORWARDING
   socket.on("translate_partner_pcm_16k", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -982,7 +972,6 @@ io.on("connection", (socket) => {
     streamPcm16kToListenerPool(roomId, listenerKey, listener, pcmBase64);
   });
 
-  // 6. CLEANUP ON LEAVE / DISCONNECT
   const cleanupSocketParticipant = () => {
     const meta = socketToMeta.get(socket.id);
     socketToMeta.delete(socket.id);
