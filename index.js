@@ -32,7 +32,7 @@ const GEMINI_LIVE_MODEL = "models/gemini-3.5-live-translate-preview";
 // Pure digital 100ms zero-silence frame at 16kHz 16-bit mono (3200 zero bytes)
 const SILENT_PCM_100MS_B64 = Buffer.alloc(3200).toString("base64");
 
-const getGeminiWsUrl = (apiVersion = "v1beta") =>
+const getGeminiWsUrl = (apiVersion = "v1alpha") =>
   `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
     GEMINI_API_KEY
   )}`;
@@ -54,7 +54,7 @@ function logTranslate(tag, msg, meta = null) {
 }
 
 // ============================================================================
-// 🔊 NATIVE 24,000 Hz 16-BIT MONO LITTLE-ENDIAN WAV BUILDER (NO CHOPPING!)
+// 🔊 NATIVE 24,000 Hz 16-BIT MONO LITTLE-ENDIAN WAV BUILDER
 // ============================================================================
 function buildNative24kWav(pcm24kBuffers) {
   const pcmData = Buffer.concat(pcm24kBuffers);
@@ -62,7 +62,7 @@ function buildNative24kWav(pcm24kBuffers) {
   const dataLen = pcmData.length;
   const totalSamples = Math.floor(dataLen / 2);
 
-  // 3ms soft edge fade (72 samples at 24kHz) prevents clicks without cutting speech
+  // 3ms soft edge fade (72 samples at 24kHz) for click-free audio
   const fadeSamples = Math.min(72, Math.floor(totalSamples / 16));
   for (let i = 0; i < fadeSamples; i++) {
     const gain = i / fadeSamples;
@@ -132,77 +132,74 @@ function normalizeForDedup(str) {
     .trim();
 }
 
-function hasRepetitionLoop(text) {
-  const words = normalizeForDedup(text).split(/\s+/).filter(Boolean);
-  if (words.length < 6) return false;
-  for (let len = 2; len <= 6; len++) {
-    if (words.length >= len * 2) {
-      const a = words.slice(words.length - len).join(" ");
-      const b = words
-        .slice(words.length - len * 2, words.length - len)
-        .join(" ");
-      if (a === b) return true;
-    }
+// Fuzzy phrase similarity check (catches near-identical repeats even if 1 word differs)
+function isFuzzyDuplicate(textA, textB) {
+  const a = normalizeForDedup(textA);
+  const b = normalizeForDedup(textB);
+  if (!a || !b || a.length < 4 || b.length < 4) return false;
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+
+  const wordsA = new Set(a.split(/\s+/).filter(Boolean));
+  const wordsB = new Set(b.split(/\s+/).filter(Boolean));
+  if (wordsA.size === 0 || wordsB.size === 0) return false;
+
+  let overlap = 0;
+  for (const w of wordsA) {
+    if (wordsB.has(w)) overlap++;
   }
-  return false;
+  const ratio = overlap / Math.min(wordsA.size, wordsB.size);
+  return ratio >= 0.72;
 }
 
 // ============================================================================
-// 🗂️ IN-MEMORY ROOM & PERSISTENT 1-SESSION-PER-DIRECTION STORE
+// 🗂️ IN-MEMORY ROOM & HOT-STANDBY SINGLE-UTTERANCE SESSION POOL
 // ============================================================================
 const rooms = new Map();
 const socketToMeta = new Map();
 
-function stopSilenceTailPacer(participant) {
-  if (participant?.silencePacerTimer) {
-    clearInterval(participant.silencePacerTimer);
-    participant.silencePacerTimer = null;
+function destroySingleSession(sess) {
+  if (!sess) return;
+  sess.closed = true;
+  if (sess.outFlushTimer) {
+    clearTimeout(sess.outFlushTimer);
+    sess.outFlushTimer = null;
   }
-}
-
-function closeListenerGeminiSession(participant) {
-  if (!participant) return;
-  stopSilenceTailPacer(participant);
-  if (participant.outFlushTimer) {
-    clearTimeout(participant.outFlushTimer);
-    participant.outFlushTimer = null;
+  if (sess.drainTimeoutTimer) {
+    clearTimeout(sess.drainTimeoutTimer);
+    sess.drainTimeoutTimer = null;
   }
-  if (participant.captionResetTimer) {
-    clearTimeout(participant.captionResetTimer);
-    participant.captionResetTimer = null;
-  }
-  participant.outPcm24kBuffers = [];
-  participant.pendingInputQueue = [];
-  const ws = participant.geminiWs;
-  participant.geminiWs = null;
-  participant.isSetupComplete = false;
-  participant.sessionTargetLang = null;
-  participant.isConnecting = false;
-  if (ws) {
+  sess.outPcm24kBuffers = [];
+  sess.pendingInputQueue = [];
+  if (sess.ws) {
     try {
-      ws.removeAllListeners();
-      ws.close();
+      sess.ws.removeAllListeners();
+      sess.ws.close();
     } catch (e) {}
+    sess.ws = null;
+  }
+}
+
+function closeAllParticipantSessions(participant) {
+  if (!participant) return;
+  destroySingleSession(participant.activeSession);
+  destroySingleSession(participant.standbySession);
+  participant.activeSession = null;
+  participant.standbySession = null;
+  if (participant.drainingSessions) {
+    for (const ds of participant.drainingSessions) {
+      destroySingleSession(ds);
+    }
+    participant.drainingSessions.clear();
   }
 }
 
 // ============================================================================
-// ⚡ UNBROKEN-CLAUSE GEMINI 3.5 LIVE TRANSLATE SESSION
+// ⚡ SINGLE-UTTERANCE GEMINI SESSION FACTORY (1 SPEAK -> 1 TRANSLATE -> WIPE!)
 // ============================================================================
-function ensureListenerGeminiSession(
-  roomId,
-  listenerKey,
-  apiVersion = "v1beta",
-  forceReset = false
-) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const listener = room.participants.get(listenerKey);
-  if (!listener) return;
-
-  if (!listener.translatorEnabled || !listener.hasMinutes) {
-    closeListenerGeminiSession(listener);
-    return;
+function createBlankMemorySession(roomId, listenerKey, listener) {
+  if (!listener || !listener.translatorEnabled || !listener.hasMinutes) {
+    return null;
   }
 
   const targetLang = String(listener.listenLang || "en")
@@ -210,134 +207,107 @@ function ensureListenerGeminiSession(
     .split("-")[0]
     .toLowerCase();
 
-  if (
-    !forceReset &&
-    listener.geminiWs &&
-    listener.geminiWs.readyState === WebSocket.OPEN &&
-    listener.sessionTargetLang === targetLang &&
-    !listener.isConnecting
-  ) {
-    return;
-  }
-
-  const now = Date.now();
-  if (
-    !forceReset &&
-    (listener.isConnecting || now - (listener.lastConnectAttemptAt || 0) < 1800)
-  ) {
-    return;
-  }
-
-  listener.isConnecting = true;
-  listener.lastConnectAttemptAt = now;
-
-  closeListenerGeminiSession(listener);
-
-  const sessionId = `gs_${Date.now()}_${Math.random()
+  const utteranceId = `utt_${Date.now()}_${Math.random()
     .toString(36)
     .substring(2, 6)}`;
-  listener.sessionId = sessionId;
 
-  const wsUrl = getGeminiWsUrl(apiVersion);
-  logTranslate(
-    "WS_CONNECTING",
-    `Connecting ${GEMINI_LIVE_MODEL} (${apiVersion}) for ${listener.email} (target: ${targetLang})`,
-    { roomId, sessionId, forceReset }
-  );
-
-  const ws = new WebSocket(wsUrl);
-  listener.geminiWs = ws;
-  listener.sessionTargetLang = targetLang;
-  listener.isSetupComplete = false;
-  listener.outPcm24kBuffers = [];
-  listener.audioSeq = 0;
-
-  let currentInputText = "";
-  let currentOutputText = "";
-  let silentOutTicks = 0;
-  let lastTurnNormText = "";
-  let lastTurnAt = 0;
-  let currentTurnId = `turn_${Date.now()}`;
-  let turnsCompletedInSession = 0;
-
-  const resetStuckLoopSession = (reason) => {
-    logTranslate(
-      "LOOP_RESET",
-      `🛑 Resetting Gemini session for ${listener.email} (${reason})`
-    );
-    listener.outPcm24kBuffers = [];
-    currentInputText = "";
-    currentOutputText = "";
-    io.to(listener.socketId).emit("translated_interrupted", {
-      roomId,
-      sessionId,
-      timestamp: Date.now(),
-    });
-    ensureListenerGeminiSession(
-      roomId,
-      listenerKey,
-      listener.useV1Alpha ? "v1alpha" : "v1beta",
-      true
-    );
+  const sess = {
+    utteranceId,
+    ws: null,
+    targetLang,
+    isSetupComplete: false,
+    hasReceivedRealSpeech: false,
+    isDraining: false,
+    turnDelivered: false,
+    closed: false,
+    silentOutTicks: 0,
+    outPcm24kBuffers: [],
+    pendingInputQueue: [],
+    inputText: "",
+    outputText: "",
+    outFlushTimer: null,
+    drainTimeoutTimer: null,
   };
 
-  // Emits ONE complete, unbroken 24kHz WAV per spoken clause so voice NEVER breaks mid-word!
-  const flushClauseWav = (isTurnEnd = false) => {
-    if (listener.outFlushTimer) {
-      clearTimeout(listener.outFlushTimer);
-      listener.outFlushTimer = null;
+  const wsUrl = getGeminiWsUrl("v1alpha");
+  const ws = new WebSocket(wsUrl);
+  sess.ws = ws;
+
+  const deliverSingleTranslationAndDestroy = (isFinal = false) => {
+    if (sess.closed || sess.turnDelivered) return;
+
+    if (sess.outFlushTimer) {
+      clearTimeout(sess.outFlushTimer);
+      sess.outFlushTimer = null;
     }
 
-    const cleanOrig = cleanCaption(currentInputText, 120);
-    const cleanTrans = cleanCaption(currentOutputText, 120);
-    const normTrans = normalizeForDedup(cleanTrans);
-    const sendSubtitles = listener.translateMode !== "voice_only";
+    // Never emit anything if this session never received real human speech!
+    if (!sess.hasReceivedRealSpeech) {
+      sess.outPcm24kBuffers = [];
+      return;
+    }
 
-    // Block exact duplicate repeat of a completed turn within 6 seconds
-    if (
-      normTrans &&
-      normTrans.length > 3 &&
-      normTrans === lastTurnNormText &&
-      Date.now() - lastTurnAt < 6000
-    ) {
-      listener.outPcm24kBuffers = [];
-      if (isTurnEnd) {
-        currentInputText = "";
-        currentOutputText = "";
+    const cleanOrig = cleanCaption(sess.inputText, 120);
+    const cleanTrans = cleanCaption(sess.outputText, 120);
+    const sendSubtitles = listener.translateMode !== "voice_only";
+    const now = Date.now();
+
+    // Fuzzy duplicate blocker (stops identical/near-identical repeats within 10s)
+    const isRepeat =
+      cleanTrans &&
+      listener.lastDeliveredTransText &&
+      now - (listener.lastDeliveredAt || 0) < 10000 &&
+      isFuzzyDuplicate(cleanTrans, listener.lastDeliveredTransText);
+
+    if (isRepeat) {
+      logTranslate(
+        "REPEAT_BLOCKED",
+        `🛡️ Blocked duplicate repeat for ${listener.email}`,
+        { text: cleanTrans }
+      );
+      sess.outPcm24kBuffers = [];
+      if (isFinal || sess.isDraining) {
+        sess.turnDelivered = true;
+        listener.drainingSessions.delete(sess);
+        if (listener.activeSession === sess) {
+          listener.activeSession = null;
+          ensureSessionPool(roomId, listenerKey);
+        }
+        destroySingleSession(sess);
       }
       return;
     }
 
+    let emittedSomething = false;
+
     if (
-      listener.outPcm24kBuffers &&
-      listener.outPcm24kBuffers.length > 0 &&
+      sess.outPcm24kBuffers.length > 0 &&
       listener.translateMode !== "text_only"
     ) {
-      const chunks = listener.outPcm24kBuffers.splice(
+      const chunks = sess.outPcm24kBuffers.splice(
         0,
-        listener.outPcm24kBuffers.length
+        sess.outPcm24kBuffers.length
       );
       const { wavBuffer, durationMs } = buildNative24kWav(chunks);
 
-      if (durationMs >= 100) {
+      if (durationMs >= 110) {
+        emittedSomething = true;
         const seq = ++listener.audioSeq;
 
         // Server-side echo shield covers network transit + full playback + room echo tail
         listener.ignoreMicUntil =
-          Math.max(Date.now(), listener.ignoreMicUntil || 0) +
-          durationMs +
-          1100;
+          Math.max(now, listener.ignoreMicUntil || 0) + durationMs + 1100;
 
         logTranslate(
           "VOICE_24K_SENT",
           `🔊 Sent unbroken 24kHz WAV #${seq} (${durationMs}ms, ${chunks.length} chunks, ->${targetLang}) to ${listener.email}`,
-          { text: cleanTrans || cleanOrig }
+          { utteranceId, text: cleanTrans || cleanOrig }
         );
 
         io.to(listener.socketId).emit("translated_audio_chunk", {
           roomId,
-          sessionId,
-          utteranceId: currentTurnId,
+          sessionId: listener.roomSessionId,
+          utteranceId,
           seq,
           wavBase64: wavBuffer.toString("base64"),
           audioFormat: "wav",
@@ -346,14 +316,16 @@ function ensureListenerGeminiSession(
           originalText: sendSubtitles && cleanOrig ? cleanOrig : null,
           translatedText: sendSubtitles && cleanTrans ? cleanTrans : null,
           targetLang,
-          timestamp: Date.now(),
+          isFinal: Boolean(isFinal || sess.isDraining),
+          timestamp: now,
         });
       }
-    } else if (sendSubtitles && (cleanOrig || cleanTrans) && isTurnEnd) {
+    } else if (sendSubtitles && (cleanOrig || cleanTrans) && isFinal) {
+      emittedSomething = true;
       io.to(listener.socketId).emit("translated_subtitle", {
         roomId,
-        sessionId,
-        utteranceId: currentTurnId,
+        sessionId: listener.roomSessionId,
+        utteranceId,
         originalText: cleanOrig || null,
         translatedText: cleanTrans || null,
         targetLang,
@@ -361,48 +333,27 @@ function ensureListenerGeminiSession(
       });
     }
 
-    if (isTurnEnd) {
-      if (normTrans && normTrans.length > 3) {
-        lastTurnNormText = normTrans;
-        lastTurnAt = Date.now();
-      }
-      currentInputText = "";
-      currentOutputText = "";
-      silentOutTicks = 0;
-      turnsCompletedInSession += 1;
-      currentTurnId = `turn_${Date.now()}_${Math.random()
-        .toString(36)
-        .substring(2, 5)}`;
+    if (emittedSomething && cleanTrans) {
+      listener.lastDeliveredTransText = cleanTrans;
+      listener.lastDeliveredAt = now;
+    }
 
-      // Proactively refresh the WebSocket every 15 idle turns so long calls never drift or loop
-      if (
-        turnsCompletedInSession >= 15 &&
-        !listener.partnerActivelySpeaking
-      ) {
-        turnsCompletedInSession = 0;
-        setTimeout(() => {
-          if (
-            listener.geminiWs === ws &&
-            !listener.partnerActivelySpeaking &&
-            listener.translatorEnabled
-          ) {
-            ensureListenerGeminiSession(
-              roomId,
-              listenerKey,
-              listener.useV1Alpha ? "v1alpha" : "v1beta",
-              true
-            );
-          }
-        }, 400);
+    // HARD LOCK & WIPE: Once the final turn finishes, DESTROY this WebSocket forever!
+    // Old memory can NEVER repeat again!
+    if (isFinal || sess.isDraining) {
+      sess.turnDelivered = true;
+      listener.drainingSessions.delete(sess);
+      if (listener.activeSession === sess) {
+        listener.activeSession = null;
+        ensureSessionPool(roomId, listenerKey);
       }
+      destroySingleSession(sess);
     }
   };
 
   ws.on("open", () => {
-    if (listener.geminiWs !== ws) return;
-    listener.isConnecting = false;
+    if (sess.closed) return;
 
-    // Official clean Live Translate config (no conflicting systemInstruction or temperature)
     const setupMessage = {
       setup: {
         model: GEMINI_LIVE_MODEL,
@@ -424,71 +375,41 @@ function ensureListenerGeminiSession(
   });
 
   ws.on("message", (rawData) => {
+    if (sess.closed || sess.turnDelivered || !listener.translatorEnabled) return;
     try {
-      if (listener.geminiWs !== ws || !listener.translatorEnabled) return;
-
       const jsonStr = Buffer.isBuffer(rawData)
         ? rawData.toString("utf8")
         : String(rawData);
       const response = JSON.parse(jsonStr);
 
       if (response.setupComplete !== undefined) {
-        listener.isSetupComplete = true;
-        logTranslate(
-          "SETUP_COMPLETE",
-          `✅ setupComplete (${apiVersion}) for ${listener.email} (target: ${targetLang})`
-        );
-        io.to(listener.socketId).emit("gemini_session_status", {
-          connected: true,
-          sessionId,
-          mode: apiVersion,
-          targetLanguageCode: targetLang,
-        });
+        sess.isSetupComplete = true;
+        if (listener.activeSession === sess) {
+          io.to(listener.socketId).emit("gemini_session_status", {
+            connected: true,
+            sessionId: listener.roomSessionId,
+            mode: "v1alpha",
+            targetLanguageCode: targetLang,
+          });
+        }
 
-        if (listener.pendingInputQueue.length > 0) {
-          const queued = listener.pendingInputQueue.splice(
+        if (sess.pendingInputQueue.length > 0) {
+          const queued = sess.pendingInputQueue.splice(
             0,
-            listener.pendingInputQueue.length
+            sess.pendingInputQueue.length
           );
           for (const b64 of queued) {
-            sendPcm16kToListenerSession(roomId, listenerKey, listener, b64);
+            sendAudioToSession(sess, b64);
           }
         }
         return;
       }
 
+      // STRICT GATE: Ignore any message from Gemini if this session hasn't received real speech!
+      if (!sess.hasReceivedRealSpeech) return;
+
       const sc = response.serverContent;
       if (!sc) return;
-
-      const nowMs = Date.now();
-
-      // Only drop unsolicited Gemini output if the partner hasn't spoken for >12 seconds
-      // AND we aren't already mid-phrase! (Never cuts off long translations!)
-      if (
-        !listener.partnerActivelySpeaking &&
-        listener.outPcm24kBuffers.length === 0 &&
-        nowMs - (listener.lastPartnerSpeechAt || 0) > 12000
-      ) {
-        currentInputText = "";
-        currentOutputText = "";
-        return;
-      }
-
-      if (sc.interrupted) {
-        listener.outPcm24kBuffers = [];
-        currentInputText = "";
-        currentOutputText = "";
-        silentOutTicks = 0;
-        if (listener.outFlushTimer) {
-          clearTimeout(listener.outFlushTimer);
-          listener.outFlushTimer = null;
-        }
-        io.to(listener.socketId).emit("translated_interrupted", {
-          roomId,
-          sessionId,
-          timestamp: nowMs,
-        });
-      }
 
       let hasNewText = false;
 
@@ -496,9 +417,7 @@ function ensureListenerGeminiSession(
         const piece = String(sc.inputTranscription.text).trim();
         if (piece) {
           hasNewText = true;
-          currentInputText = `${currentInputText} ${piece}`
-            .replace(/\s+/g, " ")
-            .trim();
+          sess.inputText = cleanCaption(`${sess.inputText} ${piece}`, 120);
         }
       }
 
@@ -506,18 +425,8 @@ function ensureListenerGeminiSession(
         const piece = String(sc.outputTranscription.text).trim();
         if (piece) {
           hasNewText = true;
-          currentOutputText = `${currentOutputText} ${piece}`
-            .replace(/\s+/g, " ")
-            .trim();
+          sess.outputText = cleanCaption(`${sess.outputText} ${piece}`, 120);
         }
-      }
-
-      if (
-        hasRepetitionLoop(currentOutputText) ||
-        hasRepetitionLoop(currentInputText)
-      ) {
-        resetStuckLoopSession("repetition_loop_detected");
-        return;
       }
 
       const parts = sc.modelTurn?.parts || [];
@@ -530,129 +439,148 @@ function ensureListenerGeminiSession(
           const outRms = calculatePcmBufferRms(outBuf);
 
           if (outRms >= 0.002) {
-            silentOutTicks = 0;
-            listener.outPcm24kBuffers.push(outBuf);
+            sess.silentOutTicks = 0;
+            sess.outPcm24kBuffers.push(outBuf);
 
-            // Keep the ENTIRE spoken sentence in ONE unbroken WAV (up to 20 chunks / ~5.0s)!
-            // Flushes cleanly on `turnComplete` OR 450ms after the last audible chunk!
-            if (listener.outPcm24kBuffers.length >= 20) {
-              flushClauseWav(false);
+            // Keep an entire normal sentence (up to 10 chunks / ~2.5s) in ONE unbroken WAV!
+            // Flushes immediately on `turnComplete` OR 380ms after the last audible chunk!
+            if (sess.outPcm24kBuffers.length >= 10) {
+              deliverSingleTranslationAndDestroy(false);
             } else {
-              clearTimeout(listener.outFlushTimer);
-              listener.outFlushTimer = setTimeout(() => {
-                flushClauseWav(true);
-              }, 450);
+              clearTimeout(sess.outFlushTimer);
+              sess.outFlushTimer = setTimeout(() => {
+                deliverSingleTranslationAndDestroy(sess.isDraining);
+              }, 380);
             }
-          } else if (listener.outPcm24kBuffers.length > 0) {
-            silentOutTicks += 1;
-            if (silentOutTicks === 1) {
-              // Keep 1 brief natural pause chunk inside the sentence
-              listener.outPcm24kBuffers.push(outBuf);
+          } else if (sess.outPcm24kBuffers.length > 0) {
+            sess.silentOutTicks += 1;
+            if (sess.silentOutTicks === 1) {
+              sess.outPcm24kBuffers.push(outBuf);
             } else {
-              // 2 consecutive silent chunks -> natural end of clause! Flush full unbroken WAV!
-              flushClauseWav(true);
+              // 2 consecutive silent output ticks -> phrase finished!
+              deliverSingleTranslationAndDestroy(sess.isDraining);
             }
           }
         }
         if (part?.text && part.text.trim()) {
           hasNewText = true;
-          currentOutputText = `${currentOutputText} ${part.text.trim()}`
-            .replace(/\s+/g, " ")
-            .trim();
+          sess.outputText = cleanCaption(
+            `${sess.outputText} ${part.text.trim()}`,
+            120
+          );
         }
       }
 
       if (
         hasNewText &&
         listener.translateMode !== "voice_only" &&
-        (currentInputText || currentOutputText)
+        (sess.inputText || sess.outputText)
       ) {
-        const cleanO = cleanCaption(currentInputText, 120);
-        const cleanT = cleanCaption(currentOutputText, 120);
-        const normT = normalizeForDedup(cleanT);
+        const isRepeat =
+          sess.outputText &&
+          listener.lastDeliveredTransText &&
+          Date.now() - (listener.lastDeliveredAt || 0) < 10000 &&
+          isFuzzyDuplicate(sess.outputText, listener.lastDeliveredTransText);
 
-        if (
-          !normT ||
-          normT !== lastTurnNormText ||
-          nowMs - lastTurnAt >= 6000
-        ) {
+        if (!isRepeat) {
           io.to(listener.socketId).emit("translated_subtitle", {
             roomId,
-            sessionId,
-            utteranceId: currentTurnId,
-            originalText: cleanO || null,
-            translatedText: cleanT || null,
+            sessionId: listener.roomSessionId,
+            utteranceId,
+            originalText: sess.inputText || null,
+            translatedText: sess.outputText || null,
             targetLang,
             isFinal: Boolean(sc.turnComplete),
           });
         }
-
-        clearTimeout(listener.captionResetTimer);
-        listener.captionResetTimer = setTimeout(() => {
-          currentInputText = "";
-          currentOutputText = "";
-        }, 2200);
       }
 
       if (sc.turnComplete || sc.generationComplete) {
-        flushClauseWav(true);
+        deliverSingleTranslationAndDestroy(true);
       }
     } catch (e) {}
   });
 
   ws.on("error", (err) => {
-    if (listener.geminiWs !== ws) return;
-    listener.isConnecting = false;
-    const msg = String(err?.message || "");
+    if (sess.closed) return;
     logTranslate(
       "WS_ERROR",
-      `WebSocket error (${apiVersion}) for ${listener.email}: ${msg}`
+      `Session error for ${listener.email}: ${err?.message || "error"}`
     );
-    if (apiVersion === "v1beta" && msg.includes("404")) {
-      listener.useV1Alpha = true;
-      listener.lastConnectAttemptAt = 0;
-      ensureListenerGeminiSession(roomId, listenerKey, "v1alpha", true);
-    }
+    destroySingleSession(sess);
   });
 
-  ws.on("close", (code) => {
-    if (listener.geminiWs !== ws) return;
-    listener.isConnecting = false;
-    listener.geminiWs = null;
-    listener.isSetupComplete = false;
-    logTranslate(
-      "WS_CLOSE",
-      `Session closed (${apiVersion}, code: ${code}) for ${listener.email}`
-    );
-    io.to(listener.socketId).emit("gemini_session_status", {
-      connected: false,
-      targetLanguageCode: targetLang,
-    });
+  ws.on("close", () => {
+    if (sess.closed) return;
+    sess.closed = true;
+    listener.drainingSessions.delete(sess);
+    if (listener.activeSession === sess) listener.activeSession = null;
+    if (listener.standbySession === sess) listener.standbySession = null;
   });
+
+  sess.forceFlushAndDestroy = () => deliverSingleTranslationAndDestroy(true);
+
+  return sess;
 }
 
-// ============================================================================
-// 📤 STREAM 100ms 16kHz PCM TO LISTENER'S PERSISTENT GEMINI LIVE SESSION
-// ============================================================================
-function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
-  if (!listener || !listener.translatorEnabled || !listener.hasMinutes) return;
+function ensureSessionPool(roomId, listenerKey) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const listener = room.participants.get(listenerKey);
+  if (!listener) return;
 
-  const preferredVersion = listener.useV1Alpha ? "v1alpha" : "v1beta";
-
-  if (!listener.geminiWs || listener.geminiWs.readyState > WebSocket.OPEN) {
-    if (listener.pendingInputQueue.length < 15) {
-      listener.pendingInputQueue.push(pcmBase64);
-    }
-    ensureListenerGeminiSession(roomId, listenerKey, preferredVersion);
+  if (!listener.translatorEnabled || !listener.hasMinutes) {
+    closeAllParticipantSessions(listener);
     return;
   }
 
+  const targetLang = String(listener.listenLang || "en")
+    .trim()
+    .split("-")[0]
+    .toLowerCase();
+
   if (
-    listener.geminiWs.readyState === WebSocket.OPEN &&
-    listener.isSetupComplete
+    listener.activeSession &&
+    listener.activeSession.targetLang !== targetLang
   ) {
+    closeAllParticipantSessions(listener);
+  }
+
+  if (!listener.activeSession || listener.activeSession.closed) {
+    if (listener.standbySession && !listener.standbySession.closed) {
+      listener.activeSession = listener.standbySession;
+      listener.standbySession = null;
+    } else {
+      listener.activeSession = createBlankMemorySession(
+        roomId,
+        listenerKey,
+        listener
+      );
+    }
+  }
+
+  // Pre-warm 1 blank standby session (rate-limited to avoid rapid reconnect storms)
+  const now = Date.now();
+  if (
+    (!listener.standbySession || listener.standbySession.closed) &&
+    now - (listener.lastStandbyCreateAt || 0) >= 1200
+  ) {
+    listener.lastStandbyCreateAt = now;
+    listener.standbySession = createBlankMemorySession(
+      roomId,
+      listenerKey,
+      listener
+    );
+  }
+}
+
+function sendAudioToSession(sess, pcmBase64, isRealSpeech = true) {
+  if (!sess || sess.closed || sess.turnDelivered) return;
+  if (isRealSpeech) sess.hasReceivedRealSpeech = true;
+
+  if (sess.ws && sess.ws.readyState === WebSocket.OPEN && sess.isSetupComplete) {
     try {
-      listener.geminiWs.send(
+      sess.ws.send(
         JSON.stringify({
           realtimeInput: {
             audio: {
@@ -663,37 +591,70 @@ function sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64) {
         })
       );
     } catch (e) {}
-  } else if (listener.pendingInputQueue.length < 15) {
-    listener.pendingInputQueue.push(pcmBase64);
+  } else if (sess.pendingInputQueue.length < 20) {
+    sess.pendingInputQueue.push(pcmBase64);
   }
 }
 
-// Paces 10 frames (~1.0s) of pure digital 0x00 silence after speech ends or on mic mute
-function triggerCleanDigitalSilenceTail(roomId, listenerKey, listener) {
-  if (!listener || !listener.translatorEnabled || !listener.hasMinutes) return;
-  stopSilenceTailPacer(listener);
+// Called the moment the speaker stops speaking (or mutes mic):
+// 1. Sends 500ms of pure digital 0x00 silence + `audioStreamEnd: true` to finish the current sentence immediately.
+// 2. Moves current session into draining (destroys itself right after emitting the 1 translation).
+// 3. Promotes the 100% blank-memory standby session into `activeSession` in 0ms!
+function finalizeUtteranceAndSwapBlankSession(roomId, listenerKey, listener) {
+  if (!listener || !listener.activeSession) return;
+  const draining = listener.activeSession;
+  if (!draining.hasReceivedRealSpeech) return;
 
-  listener.partnerActivelySpeaking = false;
+  draining.isDraining = true;
+  listener.drainingSessions.add(draining);
 
-  let remainingFrames = 10;
-  listener.silencePacerTimer = setInterval(() => {
-    if (
-      remainingFrames <= 0 ||
-      !listener.geminiWs ||
-      listener.geminiWs.readyState !== WebSocket.OPEN ||
-      !listener.isSetupComplete
-    ) {
-      stopSilenceTailPacer(listener);
-      return;
+  if (
+    draining.ws &&
+    draining.ws.readyState === WebSocket.OPEN &&
+    draining.isSetupComplete
+  ) {
+    try {
+      // Send 5 frames (500ms) of digital silence + audioStreamEnd to finalize immediately
+      for (let i = 0; i < 5; i++) {
+        draining.ws.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data: SILENT_PCM_100MS_B64,
+                mimeType: "audio/pcm;rate=16000",
+              },
+            },
+          })
+        );
+      }
+      draining.ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            audioStreamEnd: true,
+          },
+        })
+      );
+    } catch (e) {}
+  }
+
+  // Hard 3.2s ceiling: always flush whatever audio arrived, then destroy this session permanently!
+  draining.drainTimeoutTimer = setTimeout(() => {
+    if (!draining.closed) {
+      draining.forceFlushAndDestroy?.();
     }
-    remainingFrames -= 1;
-    sendPcm16kToListenerSession(
-      roomId,
-      listenerKey,
-      listener,
-      SILENT_PCM_100MS_B64
-    );
-  }, 100);
+  }, 3200);
+
+  // Swap in the blank standby session immediately so the next spoken sentence has ZERO old memory!
+  listener.activeSession = null;
+  ensureSessionPool(roomId, listenerKey);
+}
+
+function streamSpeechChunkToListener(roomId, listenerKey, listener, pcmBase64) {
+  if (!listener || !listener.translatorEnabled || !listener.hasMinutes) return;
+  ensureSessionPool(roomId, listenerKey);
+  if (listener.activeSession) {
+    sendAudioToSession(listener.activeSession, pcmBase64, true);
+  }
 }
 
 function broadcastRoomTranslateState(roomId) {
@@ -754,30 +715,31 @@ io.on("connection", (socket) => {
       email: String(email).trim(),
       emailKey,
       socketId: socket.id,
-      sessionId: null,
+      roomSessionId: `rs_${Date.now()}_${Math.random()
+        .toString(36)
+        .substring(2, 5)}`,
       speakLang: String(speakLang || "en"),
       listenLang: String(listenLang || "bn"),
       translateMode: String(translateMode || "both"),
       translatorEnabled: Boolean(translatorEnabled),
       hasMinutes: Boolean(hasMinutes),
-      geminiWs: null,
-      isSetupComplete: false,
-      sessionTargetLang: null,
-      isConnecting: false,
-      useV1Alpha: false,
-      lastConnectAttemptAt: 0,
+      activeSession: null,
+      standbySession: null,
+      drainingSessions: new Set(),
+      lastStandbyCreateAt: 0,
       isClientPlayingAudio: false,
       ignoreMicUntil: 0,
-      partnerActivelySpeaking: false,
-      lastPartnerSpeechAt: 0,
       lastInSeqReceived: 0,
       audioSeq: 0,
-      outPcm24kBuffers: [],
-      pendingInputQueue: [],
+      lastDeliveredTransText: "",
+      lastDeliveredAt: 0,
+      // Adaptive noise floor & speech state machine
+      noiseFloorRms: 0.008,
+      speechStreakCount: 0,
+      speechStreakChunks: [],
       preRollChunks: [],
       hangoverLeft: 0,
-      wasSpeaking: false,
-      silencePacerTimer: null,
+      isSpeaking: false,
     };
 
     participant.socketId = socket.id;
@@ -797,13 +759,9 @@ io.on("connection", (socket) => {
     broadcastRoomTranslateState(roomId);
 
     if (participant.translatorEnabled && participant.hasMinutes) {
-      ensureListenerGeminiSession(
-        roomId,
-        emailKey,
-        participant.useV1Alpha ? "v1alpha" : "v1beta"
-      );
+      ensureSessionPool(roomId, emailKey);
     } else {
-      closeListenerGeminiSession(participant);
+      closeAllParticipantSessions(participant);
     }
   });
 
@@ -823,13 +781,15 @@ io.on("connection", (socket) => {
     participant.isClientPlayingAudio = playing;
     if (playing) {
       participant.preRollChunks = [];
+      participant.speechStreakCount = 0;
+      participant.speechStreakChunks = [];
       participant.hangoverLeft = 0;
-      participant.wasSpeaking = false;
+      participant.isSpeaking = false;
     } else {
-      // 800ms post-playback cooldown completely absorbs Android's capture buffer + loudspeaker reverb
+      // 900ms post-playback cooldown blocks Android's audio capture buffer + room reverb
       participant.ignoreMicUntil = Math.max(
         participant.ignoreMicUntil || 0,
-        Date.now() + 800
+        Date.now() + 900
       );
     }
   });
@@ -885,28 +845,16 @@ io.on("connection", (socket) => {
     participant.translatorEnabled = nextEnabled;
     participant.hasMinutes = nextMins;
 
-    if (nextMode === "text_only") {
-      participant.outPcm24kBuffers = [];
-      if (participant.outFlushTimer) {
-        clearTimeout(participant.outFlushTimer);
-        participant.outFlushTimer = null;
-      }
-    }
-
     broadcastRoomTranslateState(roomId);
 
     if (participant.translatorEnabled && participant.hasMinutes) {
       if (listenChanged) {
-        closeListenerGeminiSession(participant);
-        participant.lastConnectAttemptAt = 0;
+        closeAllParticipantSessions(participant);
+        participant.lastStandbyCreateAt = 0;
       }
-      ensureListenerGeminiSession(
-        roomId,
-        emailKey,
-        participant.useV1Alpha ? "v1alpha" : "v1beta"
-      );
+      ensureSessionPool(roomId, emailKey);
     } else {
-      closeListenerGeminiSession(participant);
+      closeAllParticipantSessions(participant);
     }
   });
 
@@ -922,18 +870,21 @@ io.on("connection", (socket) => {
     const speaker = room.participants.get(speakerKey);
     if (speaker) {
       speaker.preRollChunks = [];
+      speaker.speechStreakCount = 0;
+      speaker.speechStreakChunks = [];
       speaker.hangoverLeft = 0;
-      speaker.wasSpeaking = false;
-    }
-
-    for (const [listenerKey, listener] of room.participants.entries()) {
-      if (listenerKey === speakerKey) continue;
-      if (!listener.translatorEnabled || !listener.hasMinutes) continue;
-      triggerCleanDigitalSilenceTail(roomId, listenerKey, listener);
+      if (speaker.isSpeaking) {
+        speaker.isSpeaking = false;
+        for (const [listenerKey, listener] of room.participants.entries()) {
+          if (listenerKey === speakerKey) continue;
+          if (!listener.translatorEnabled || !listener.hasMinutes) continue;
+          finalizeUtteranceAndSwapBlankSession(roomId, listenerKey, listener);
+        }
+      }
     }
   });
 
-  // CONTINUOUS 100ms STREAM WITH DIGITAL SILENCE SUBSTITUTION (ZERO HOLES, ZERO ECHO!)
+  // ADAPTIVE NOISE-FLOOR SPEECH STATE MACHINE (ZERO SILENCE HALLUCINATIONS!)
   socket.on("stream_mic_pcm_16k", (payload) => {
     const meta = socketToMeta.get(socket.id);
     const roomId = payload?.roomId || meta?.roomId;
@@ -957,21 +908,22 @@ io.on("connection", (socket) => {
 
     const now = Date.now();
 
-    // 1. CLIENT EXPLICIT SILENCE SENTINEL OR ECHO SHIELD:
-    // If muted or playing translated audio, flush clean digital silence if they were just speaking, then stay silent!
+    // 1. CLIENT SILENCE / ECHO SHIELD: Never forward loudspeaker bleed!
     if (
       pcmBase64 === "SILENCE" ||
       speaker.isClientPlayingAudio ||
       now < (speaker.ignoreMicUntil || 0)
     ) {
       speaker.preRollChunks = [];
+      speaker.speechStreakCount = 0;
+      speaker.speechStreakChunks = [];
       speaker.hangoverLeft = 0;
-      if (speaker.wasSpeaking) {
-        speaker.wasSpeaking = false;
+      if (speaker.isSpeaking) {
+        speaker.isSpeaking = false;
         for (const [listenerKey, listener] of room.participants.entries()) {
           if (listenerKey === speakerKey) continue;
           if (!listener.translatorEnabled || !listener.hasMinutes) continue;
-          triggerCleanDigitalSilenceTail(roomId, listenerKey, listener);
+          finalizeUtteranceAndSwapBlankSession(roomId, listenerKey, listener);
         }
       }
       return;
@@ -993,58 +945,90 @@ io.on("connection", (socket) => {
       now < (room.floorLockUntil || 0)
     ) {
       if (rms < (room.activeSpeakerRms || 0.03) * 1.65) {
-        speaker.preRollChunks = [];
-        speaker.hangoverLeft = 0;
+        speaker.speechStreakCount = 0;
+        speaker.speechStreakChunks = [];
         return;
       }
     }
 
-    // 0.009 threshold catches soft speech reliably without picking up room fan/static
-    if (rms >= 0.009) {
-      room.activeSpeakerKey = speakerKey;
-      room.activeSpeakerRms = rms;
-      room.floorLockUntil = now + 450;
+    // Adaptive speech threshold: automatically stays above room fan/static noise!
+    const adaptiveThreshold = Math.min(
+      0.045,
+      Math.max(0.016, (speaker.noiseFloorRms || 0.008) * 2.6)
+    );
+    const continueThreshold = adaptiveThreshold * 0.72;
 
-      // 5 chunks (500ms) hangover keeps mid-sentence word pauses & soft endings 100% intact
-      speaker.hangoverLeft = 5;
-      speaker.wasSpeaking = true;
+    if (speaker.isSpeaking) {
+      if (rms >= continueThreshold) {
+        room.activeSpeakerKey = speakerKey;
+        room.activeSpeakerRms = rms;
+        room.floorLockUntil = now + 450;
+        // 500ms (5 x 100ms) natural pause hangover inside a sentence
+        speaker.hangoverLeft = 5;
 
-      for (const [listenerKey, listener] of room.participants.entries()) {
-        if (listenerKey === speakerKey) continue;
-        if (!listener.translatorEnabled || !listener.hasMinutes) continue;
-
-        stopSilenceTailPacer(listener);
-        listener.partnerActivelySpeaking = true;
-        listener.lastPartnerSpeechAt = now;
-
-        if (speaker.preRollChunks.length > 0) {
-          for (const preB64 of speaker.preRollChunks) {
-            sendPcm16kToListenerSession(roomId, listenerKey, listener, preB64);
-          }
+        for (const [listenerKey, listener] of room.participants.entries()) {
+          if (listenerKey === speakerKey) continue;
+          if (!listener.translatorEnabled || !listener.hasMinutes) continue;
+          streamSpeechChunkToListener(roomId, listenerKey, listener, pcmBase64);
         }
-        sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64);
-      }
-      speaker.preRollChunks = [];
-    } else if (speaker.hangoverLeft > 0) {
-      speaker.hangoverLeft -= 1;
-      for (const [listenerKey, listener] of room.participants.entries()) {
-        if (listenerKey === speakerKey) continue;
-        if (!listener.translatorEnabled || !listener.hasMinutes) continue;
-        listener.lastPartnerSpeechAt = now;
-        sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64);
-      }
-    } else if (speaker.wasSpeaking) {
-      speaker.wasSpeaking = false;
-      for (const [listenerKey, listener] of room.participants.entries()) {
-        if (listenerKey === speakerKey) continue;
-        if (!listener.translatorEnabled || !listener.hasMinutes) continue;
-        triggerCleanDigitalSilenceTail(roomId, listenerKey, listener);
+      } else if (speaker.hangoverLeft > 0) {
+        speaker.hangoverLeft -= 1;
+        for (const [listenerKey, listener] of room.participants.entries()) {
+          if (listenerKey === speakerKey) continue;
+          if (!listener.translatorEnabled || !listener.hasMinutes) continue;
+          streamSpeechChunkToListener(roomId, listenerKey, listener, pcmBase64);
+        }
+      } else {
+        // Speaker stopped talking for 500ms -> Finalize this ONE sentence and swap to blank session!
+        speaker.isSpeaking = false;
+        speaker.speechStreakCount = 0;
+        speaker.speechStreakChunks = [];
+        for (const [listenerKey, listener] of room.participants.entries()) {
+          if (listenerKey === speakerKey) continue;
+          if (!listener.translatorEnabled || !listener.hasMinutes) continue;
+          finalizeUtteranceAndSwapBlankSession(roomId, listenerKey, listener);
+        }
       }
     } else {
-      // Keep 200ms pre-roll (2 x 100ms chunks) so the very first syllable is never clipped
-      speaker.preRollChunks.push(pcmBase64);
-      if (speaker.preRollChunks.length > 2) {
-        speaker.preRollChunks.shift();
+      // Currently IDLE (silent): require 2 consecutive chunks (200ms) above adaptive threshold
+      // so clicks, taps, breaths, and room noise NEVER wake up Gemini!
+      if (rms >= adaptiveThreshold) {
+        speaker.speechStreakCount += 1;
+        speaker.speechStreakChunks.push(pcmBase64);
+
+        if (speaker.speechStreakCount >= 2) {
+          speaker.isSpeaking = true;
+          speaker.hangoverLeft = 5;
+          room.activeSpeakerKey = speakerKey;
+          room.activeSpeakerRms = rms;
+          room.floorLockUntil = now + 450;
+
+          const startChunks = [
+            ...speaker.preRollChunks,
+            ...speaker.speechStreakChunks,
+          ];
+          speaker.preRollChunks = [];
+          speaker.speechStreakCount = 0;
+          speaker.speechStreakChunks = [];
+
+          for (const [listenerKey, listener] of room.participants.entries()) {
+            if (listenerKey === speakerKey) continue;
+            if (!listener.translatorEnabled || !listener.hasMinutes) continue;
+            for (const c of startChunks) {
+              streamSpeechChunkToListener(roomId, listenerKey, listener, c);
+            }
+          }
+        }
+      } else {
+        // Slowly adapt ambient room noise floor while silent
+        speaker.noiseFloorRms =
+          (speaker.noiseFloorRms || 0.008) * 0.92 + rms * 0.08;
+        speaker.speechStreakCount = 0;
+        speaker.speechStreakChunks = [];
+        speaker.preRollChunks.push(pcmBase64);
+        if (speaker.preRollChunks.length > 2) {
+          speaker.preRollChunks.shift();
+        }
       }
     }
   });
@@ -1064,8 +1048,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    listener.lastPartnerSpeechAt = Date.now();
-    sendPcm16kToListenerSession(roomId, listenerKey, listener, pcmBase64);
+    streamSpeechChunkToListener(roomId, listenerKey, listener, pcmBase64);
   });
 
   const cleanupSocketParticipant = () => {
@@ -1079,7 +1062,7 @@ io.on("connection", (socket) => {
 
     const participant = room.participants.get(emailKey);
     if (participant && participant.socketId === socket.id) {
-      closeListenerGeminiSession(participant);
+      closeAllParticipantSessions(participant);
       room.participants.delete(emailKey);
     }
 
